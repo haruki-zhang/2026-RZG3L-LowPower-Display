@@ -1,0 +1,21 @@
+[Unit]
+Description=LowPower Display Demo GUI
+After=weston.service lpdemo-cm33-grant.service
+Wants=weston.service lpdemo-cm33-grant.service
+
+[Service]
+# root: the GUI writes the LP layers to SRAM and suspends the system (Step 3/4)
+Environment=WAYLAND_DISPLAY=/run/wayland-0
+Environment=XDG_RUNTIME_DIR=/run/lpdemo-gui
+Environment=GDK_BACKEND=wayland
+# "Enter Low Power": retention (3b, full DISP_RET), sleep (Step 3a, DDR active),
+# none (Step 2 hand-over without system suspend). Override: systemctl edit lpdemo-gui
+Environment=LPDEMO_SUSPEND_MODE=retention
+RuntimeDirectory=lpdemo-gui
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/lpdemo-gui
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical.target

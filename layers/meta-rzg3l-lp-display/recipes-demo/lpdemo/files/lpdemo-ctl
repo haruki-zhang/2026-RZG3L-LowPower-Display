@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+"""
+lpdemo-ctl - inspect and control the CM33 firmware of the RZ/G3L LowPower Display Demo.
+
+  lpdemo-ctl [--wait SEC] <command>
+
+  lpdemo-ctl status [--json]   show the control block
+  lpdemo-ctl grant             hand RIIC0 (I2C_PM) over to the CM33 (done at boot by
+                               lpdemo-cm33-grant.service)
+  lpdemo-ctl revoke            take RIIC0 back (e.g. before using i2c-tools on the bus)
+  lpdemo-ctl period <ms>       sampling period (0 = default 500 ms)
+  lpdemo-ctl watch [-i SEC]    print one line per new sample
+
+Display hand-over to the CM33 (Step 2, without system suspend):
+  lpdemo-ctl lp status         hand-over state and statistics
+  lpdemo-ctl lp samples        power samples the CM33 took during the last LP period
+  lpdemo-ctl lp probe          frame timing probe of the last hand-over (read-out sync)
+  lpdemo-ctl lp run            hand over, wait for USER_SW3, give back (what the GUI does)
+  lpdemo-ctl lp enter / leave  the two halves of "lp run"
+  lpdemo-ctl lp cycle N        N automatic round trips (the CM33 returns after --hold-ms)
+
+Weston is stopped (SIGSTOP) while the CM33 owns the display, as the system suspend freezer
+does in Step 3: no page flip may be pending during the LP period.
+
+System suspend with the display kept running (DISP_RET, Step 3):
+  lpdemo-ctl suspend [--mode sleep|retention] [--plain-wfi] [--wake-ms MS]
+                               echo mem > /sys/power/state with the LP picture on the
+                               screen; USER_SW3 (or --wake-ms) wakes the system up
+      --mode sleep             3a: the DDR stays active (default: $LPDEMO_SUSPEND_MODE or sleep)
+      --mode retention         3b: DDR in self-refresh, PLL4 in standby (full DISP_RET)
+      --plain-wfi              CA55 in plain WFI instead of the Cortex-A55 Sleep Mode
+      --late-return            keep the LP picture (and the --progress bar) until Linux takes
+                               the display back in the resume (bring-up)
+      --no-console-suspend     keep the kernel console on through the suspend/resume, and
+                               print the progress of BL31 and the CM33 on it
+      --debug                  --late-return --no-console-suspend --progress
+  lpdemo-ctl suspend-cycle N [--wake-ms MS] [--gap-ms MS] ...   N automatic suspends
+
+LP picture (Step 4, design_handoff_lpdemo_gui section 7), options of lp and suspend:
+      --baseline-mw MW         normal mode power the saving is computed against (the GUI
+                               passes the mean of the last 10 s; default: the current
+                               mean of the CM33)
+      --no-readout             the CM33 does not redraw the power read-out (RPF1 shows
+                               the value at the hand-over)
+      --progress               suspend progress bar at the bottom of RPF1 (debug)
+"""
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+import lpdemo_shm as shm
+
+DU_DRIVER_DIR = "/sys/bus/platform/drivers/rzg2l-du"
+STATE_FILE = "/run/lpdemo-weston-stopped"
+SUSPEND_MODES = {"sleep": 0, "retention": shm.SUSP_MODE_DDR_RET}
+
+
+def cmd_status(ctrl, args):
+    d = ctrl.snapshot()
+    if args.json:
+        print(json.dumps(d, indent=2, sort_keys=True))
+        return 0 if d["valid"] else 1
+    if not d["valid"]:
+        print("control block not initialised (magic 0x%08x version %d): "
+              "is the CM33 firmware running?" % (d["magic"], d["version"]))
+        return 1
+    if d["cm33_clk_hz"]:
+        clk = "%.1f MHz" % (d["cm33_clk_hz"] / 1e6)
+    elif d["uptime_ms"]:
+        # SysTick is programmed for 10 ms at 200 MHz; uptime comes from SYC (24 MHz)
+        clk = "not measurable, 200 MHz assumed; SysTick rate says %.0f MHz" % (
+            200.0 * d["heartbeat"] * 10 / d["uptime_ms"])
+    else:
+        clk = "not measurable, 200 MHz assumed"
+    print("CM33 firmware   : %s (clock %s)" % (shm.fw_version_str(d["fw_version"]), clk))
+    print("CM33 state      : %s  heartbeat %d  uptime %.1f s" %
+          (d["cm33_state_name"], d["heartbeat"], d["uptime_ms"] / 1000.0))
+    if d["cm33_state"] == 0xEE:
+        print("  FAULT pc 0x%08x lr 0x%08x cfsr 0x%08x" %
+              (d["fault_pc"], d["fault_lr"], d["fault_cfsr"]))
+    print("RIIC0 grant     : %s" % ("granted" if d["i2c_grant"] == shm.I2C_GRANT else "no"))
+    print("period          : %d ms" % (d["period_ms"] or 500))
+    print("measurement     : %s  samples %d  errors %d" %
+          (d["pm_status_name"], d["pm_count"], d["pm_err_count"]))
+    print("DISP_RET        : %s  suspends %d  wake-ups %d  last result %s  BL31 %s" %
+          (d["susp_state_name"], d["susp_count"], d["wake_count"], d["susp_result_name"],
+           d["bl31_stage_name"]))
+    if d["wake_count"]:
+        print("  last wake-up  : PLL4 %d us  DDR retention exit %d us" %
+              (d["pll4_us"], d["ddr_exit_us"]))
+    try:
+        t = ctrl.trace()
+    except shm.LpdemoError:
+        t = None
+    if t:
+        print("last suspend    : #%d mode 0x%x  BL31 %s  CM33 %s  result %s  "
+              "(trace kept across a reset; CM33 starts %d, retcsr %s)" %
+              (t["susp_count"], t["susp_mode"], t["bl31_stage_name"], t["cm33_stage_name"],
+               t["susp_result_name"], t["boot_count"], "ok" if t["retcsr_valid"] else "MISSING"))
+    print("ISL28022        : addr 0x%02x  config 0x%04x  Rshunt %.3f mOhm" %
+          (d["i2c_addr"], d["isl_config"], d["rshunt_uohm"] / 1000.0))
+    if d["pm_count"]:
+        print("5V_MODULE       : %6.3f V  %7.1f mA  (Vshunt %.2f mV, raw 0x%04x/0x%04x)" %
+              (d["vbus_mv"] / 1000.0, d["current_ma"], d["vshunt_uv"] / 1000.0,
+               d["raw_vbus"], d["raw_vshunt"]))
+        print("power           : %6.3f W  (mean of 4: %.3f W)" %
+              (d["power_mw"] / 1000.0, d["power_avg_mw"] / 1000.0))
+    return 0
+
+
+def cmd_grant(ctrl, args):
+    ctrl.grant_i2c(True)
+    return 0
+
+
+def cmd_revoke(ctrl, args):
+    ctrl.grant_i2c(False)
+    # let the CM33 finish a transfer in progress (one 10 ms tick + one transfer)
+    time.sleep(0.05)
+    return 0
+
+
+def cmd_period(ctrl, args):
+    ctrl.set_period(args.ms)
+    return 0
+
+
+def cmd_watch(ctrl, args):
+    last = None
+    try:
+        while True:
+            d = ctrl.snapshot()
+            if d["pm_count"] != last:
+                last = d["pm_count"]
+                print("%s  %-11s  %6.3f V  %7.1f mA  %6.3f W  avg %6.3f W  err %d" %
+                      (time.strftime("%H:%M:%S"), d["pm_status_name"], d["vbus_mv"] / 1000.0,
+                       d["current_ma"], d["power_mw"] / 1000.0,
+                       d["power_avg_mw"] / 1000.0, d["pm_err_count"]), flush=True)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def du_lp_display():
+    try:
+        for entry in sorted(os.listdir(DU_DRIVER_DIR)):
+            path = os.path.join(DU_DRIVER_DIR, entry, "lp_display")
+            if os.path.exists(path):
+                return path
+    except FileNotFoundError:
+        pass
+    raise shm.LpdemoError("rz-du lp_display not found (kernel without the hand-over patch, "
+                          "or renesas,lpdemo-ctrl missing in the DU node?)")
+
+
+def weston_pids():
+    pids = []
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            try:
+                with open("/proc/%s/comm" % entry) as f:
+                    if f.read().strip() == "weston":
+                        pids.append(int(entry))
+            except OSError:
+                pass
+    return pids
+
+
+def weston_signal(sig):
+    pids = weston_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+    return pids
+
+
+def kernel_errors():
+    """Number of display related errors in the kernel log so far."""
+    try:
+        log = subprocess.run(["dmesg"], capture_output=True, text=True).stdout
+    except OSError:
+        return 0
+    keys = ("flip_done timed out", "lpdemo:", "vblank wait timed out")
+    return sum(1 for line in log.splitlines() if any(k in line for k in keys)
+               and "hand-over at" not in line)
+
+
+def lp_enter(ctrl, args):
+    if ctrl.read("disp_state") != shm.DISP_LINUX:
+        raise shm.LpdemoError("the CM33 already owns the display")
+    write_lp_layers(ctrl, args)
+    ctrl.write("auto_return_ms", getattr(args, "hold_ms", 0) or 0)
+    ctrl.write("sw3_wake", 1)
+    path = du_lp_display()
+    pids = []
+    if not args.no_stop:
+        pids = weston_signal(signal.SIGSTOP)
+        with open(STATE_FILE, "w") as f:
+            f.write(" ".join(map(str, pids)))
+    try:
+        with open(path, "w") as f:
+            f.write("cm33")
+    except OSError as e:
+        weston_continue()
+        raise shm.LpdemoError("hand-over refused: %s (CM33 result %s)" %
+                              (e.strerror, shm.DISP_RESULT.get(ctrl.read("disp_result"), "?")))
+
+
+def weston_continue():
+    weston_signal(signal.SIGCONT)
+    try:
+        os.unlink(STATE_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def lp_leave(ctrl, args):
+    try:
+        with open(du_lp_display(), "w") as f:
+            f.write("linux")
+    except OSError as e:
+        raise shm.LpdemoError("give-back failed: %s" % e.strerror)
+    finally:
+        # Never leave Weston stopped, even if the CM33 does not answer
+        if ctrl.read("disp_state") == shm.DISP_LINUX:
+            weston_continue()
+
+
+def lp_wait_return(ctrl, timeout):
+    deadline = time.monotonic() + timeout if timeout else None
+    while ctrl.read("disp_state") != shm.DISP_LINUX:
+        if deadline and time.monotonic() > deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def cmd_lp_status(ctrl, args):
+    d = ctrl.snapshot()
+    try:
+        with open(du_lp_display()) as f:
+            linux_view = f.read().strip()
+    except (shm.LpdemoError, OSError):
+        linux_view = "n/a"
+    print("display         : CM33 %s / rz-du %s  (last wake: %s, last result: %s)" %
+          (d["disp_state_name"], linux_view, d["disp_wake_name"], d["disp_result_name"]))
+    print("counts          : enter %d  leave %d  errors %d  WPF0 underruns %d" %
+          (d["enter_count"], d["leave_count"], d["disp_err_count"], d["und_count"]))
+    print("last switch     : enter %d us  leave %d us" % (d["enter_us"], d["leave_us"]))
+    print("output          : %dx%d  Linux DL 0x%08x  WPF0_IRQ_ENB 0x%08x" %
+          (d["out_size"] >> 16, d["out_size"] & 0xFFFF, d["linux_hdr"], d["saved_irq_enb"]))
+    print("LP layers       : RPF0 %dx%d at (%d,%d)  RPF1 %dx%d at (%d,%d)  flags 0x%x" %
+          (d["img_w"], d["img_h"], d["img_x"], d["img_y"], d["bar_w"], d["bar_h"],
+           d["bar_x"], d["bar_y"], d["lp_flags"]))
+    # Read back by the CM33 after the last ENTER: RPF1 shown = active in SRCRPF + RBC
+    rpf1 = bool(d["lp_srcrpf"] & (3 << 2)) and bool(d["lp_brs_ctrl1"] & (1 << 31))
+    print("last LP list    : WPF0_SRCRPF 0x%08x  BRS_CTRL1 0x%08x  (RPF1 %s)" %
+          (d["lp_srcrpf"], d["lp_brs_ctrl1"], "shown" if rpf1 else "NOT shown"))
+    shown = ("-.---" if d["readout_mw"] == shm.READOUT_NONE else
+             "%.3f W" % (d["readout_mw"] / 1000.0))
+    pct = "" if d["readout_pct"] == shm.READOUT_NONE else "  -%d%%" % d["readout_pct"]
+    print("read-out        : %s%s (baseline %d mW)  redraws %d  last %d px in %d us after a "
+          "%d us wait  late %d" % (shown, pct, d["baseline_mw"], d["readout_count"],
+                                   d["readout_px"], d["readout_us"], d["readout_wait_us"],
+                                   d["readout_late"]))
+    p = ctrl.probe()
+    if p and p["sync"]:
+        sync = "%s %s bit %d (period %d us, short phase %d us)" % (
+            shm.SYNC.get(p["sync"], "?"), shm.PROBE_REG_NAMES[p["sync_reg"]], p["sync_bit"],
+            p["sync_period_us"], p["sync_short_us"])
+    else:
+        sync = "none found (lpdemo-ctl lp probe)" if p else "no probe yet"
+    print("read-out sync   : %s" % sync)
+    print("LP samples      : %d every %d ms" % (d["ring_count"], d["ring_period_ms"]))
+    print("USER_SW3        : %s  (wake %s)  auto return %d ms" %
+          ("pressed" if d["sw3_pin"] == 0 else "released",
+           "on" if d["sw3_wake"] else "off", d["auto_return_ms"]))
+    return 0
+
+
+def cmd_lp_samples(ctrl, args):
+    syc0, period, samples = ctrl.lp_samples()
+    print("%d samples, every %d ms, first at SYC %d (%.1f s)" %
+          (len(samples), period, syc0, syc0 / float(shm.SYC_HZ)))
+    for k, v in enumerate(samples):
+        print("%7.1f s  %s" % (k * period / 1000.0, "-" if v is None else "%.3f W" % (v / 1000.0)))
+    return 0
+
+
+def cmd_lp_probe(ctrl, args):
+    p = ctrl.probe()
+    if p is None:
+        print("no probe yet (it runs at every hand-over to the CM33)")
+        return 1
+    print("probe #%d: %d samples of every register in %d us (%.1f us per round)" %
+          (p["count"], p["samples"], p["duration_us"],
+           p["duration_us"] / float(p["samples"] or 1)))
+    print("WPF0_IRQ_STA clear test: before 0x%08x  write 0 -> 0x%08x (+100 us 0x%08x)  "
+          "write 1 -> 0x%08x" % (p["sta_before"], p["sta_w0c"], p["sta_w0c_100us"],
+                                  p["sta_w1c_100us"]))
+    print("%-22s %-10s %-10s %-10s %s" % ("register", "address", "first", "toggled", "changes"))
+    for r in p["regs"]:
+        print("%-22s 0x%08x 0x%08x 0x%08x %d" % (r["name"], r["addr"], r["first"],
+                                                r["toggled"], r["changes"]))
+    print("bits that changed (LATCH registers: set again after being cleared):")
+    print("  %-22s %3s %8s %6s %5s %-6s %9s %8s" % ("register", "bit", "changes", "bursts",
+                                                   "gaps", "kind", "period", "short"))
+    for b in p["bits"]:
+        print("  %-22s %3d %8d %6d %5d %-6s %6d us %5d us" % (
+            shm.PROBE_REG_NAMES[b["reg"]], b["bit"], b["changes"], b["bursts"], b["gaps"],
+            shm.SYNC.get(b["kind"], "?") if b["kind"] else "-", b["period_us"], b["short_us"]))
+    if p["sync"]:
+        print("frame boundary: %s %s bit %d, period %d us, short phase %d us" %
+              (shm.SYNC.get(p["sync"], "?"), shm.PROBE_REG_NAMES[p["sync_reg"]], p["sync_bit"],
+               p["sync_period_us"], p["sync_short_us"]))
+    else:
+        print("frame boundary: no once-per-frame pattern found")
+    return 0
+
+
+def cmd_lp_enter(ctrl, args):
+    lp_enter(ctrl, args)
+    return 0
+
+
+def cmd_lp_leave(ctrl, args):
+    lp_leave(ctrl, args)
+    return 0
+
+
+def cmd_lp_run(ctrl, args):
+    args.hold_ms = 0
+    lp_enter(ctrl, args)
+    try:
+        if not lp_wait_return(ctrl, args.timeout):
+            print("no USER_SW3 within %d s: giving the display back" % args.timeout)
+    finally:
+        lp_leave(ctrl, args)
+    d = ctrl.snapshot()
+    print("back to Linux (%s): enter %d us, leave %d us, underruns %d" %
+          (d["disp_wake_name"], d["enter_us"], d["leave_us"], d["und_count"]))
+    return 0
+
+
+def cmd_lp_cycle(ctrl, args):
+    start = ctrl.snapshot()
+    err0 = kernel_errors()
+    ok = 0
+    t0 = time.monotonic()
+    try:
+        for i in range(1, args.count + 1):
+            und = ctrl.read("und_count")
+            lp_enter(ctrl, args)
+            try:
+                returned = lp_wait_return(ctrl, args.hold_ms / 1000.0 + 2.0)
+            finally:
+                lp_leave(ctrl, args)
+            d = ctrl.snapshot()
+            fail = []
+            if not returned:
+                fail.append("CM33 did not return by itself")
+            if d["und_count"] != und:
+                fail.append("WPF0 underrun")
+            if fail:
+                print("[%d/%d] FAIL: %s" % (i, args.count, ", ".join(fail)), flush=True)
+                if not args.keep_going:
+                    break
+            else:
+                ok += 1
+            if i % 50 == 0 or i == args.count:
+                print("[%d/%d] ok %d  enter %d us  leave %d us" %
+                      (i, args.count, ok, d["enter_us"], d["leave_us"]), flush=True)
+            time.sleep(args.gap_ms / 1000.0)
+    except KeyboardInterrupt:
+        print("interrupted")
+    finally:
+        ctrl.write("auto_return_ms", 0)
+    end = ctrl.snapshot()
+    kerr = kernel_errors() - err0
+    print("lp cycle: %d ok of %d in %.0f s; enter %d leave %d; CM33 errors %d; underruns %d; "
+          "kernel log errors %d" %
+          (ok, args.count, time.monotonic() - t0,
+           end["enter_count"] - start["enter_count"], end["leave_count"] - start["leave_count"],
+           end["disp_err_count"] - start["disp_err_count"],
+           end["und_count"] - start["und_count"], kerr))
+    return 0 if ok == args.count and kerr == 0 else 1
+
+
+_lp_layers_written = None
+
+
+def current_power_mw(ctrl):
+    d = ctrl.snapshot()
+    if d["pm_status"] == 0 and d["pm_count"] and 0 <= d["power_avg_mw"] <= 9999:
+        return d["power_avg_mw"]
+    return None
+
+
+def write_lp_layers(ctrl, args):
+    """
+    Baseline, then the two LP layers: rendered and written once per process (lp cycle,
+    suspend-cycle) - the CM33 draws the current value at every hand-over anyway.
+    """
+    global _lp_layers_written
+    import lpdemo_lpimage as lpimg
+
+    baseline = getattr(args, "baseline_mw", None)
+    if baseline is None:
+        baseline = _lp_layers_written if _lp_layers_written is not None else \
+            (current_power_mw(ctrl) or 0)
+    ctrl.write("baseline_mw", baseline)
+    flags = 0 if getattr(args, "no_readout", False) else shm.LP_F_READOUT
+    if getattr(args, "progress", False):
+        flags |= shm.LP_F_PROGRESS
+    if _lp_layers_written is None:
+        rpf0 = (lpimg.render_rpf0(), lpimg.LAYER_W, lpimg.LAYER_H, lpimg.RPF0_X, lpimg.RPF0_Y)
+        rpf1 = (lpimg.render_rpf1(current_power_mw(ctrl), baseline), lpimg.LAYER_W,
+                lpimg.LAYER_H, lpimg.RPF1_X, lpimg.RPF1_Y)
+        ctrl.write_lp_layers(rpf0, rpf1, lpimg.LP_BG, flags)
+        _lp_layers_written = baseline
+    else:
+        ctrl.write("lp_flags", flags)
+
+
+def boottime():
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def system_suspend(ctrl, args, mode, wake_ms, plain_wfi=False, late_return=False,
+                   debug_uart=False):
+    """
+    One DISP_RET suspend: returns (ok, info dict). The rz-du suspend hands the display
+    over to the CM33; the CM33 gives it back and wakes the CA55 up on USER_SW3 / wake_ms.
+    """
+    if ctrl.read("disp_state") != shm.DISP_LINUX:
+        raise shm.LpdemoError("the CM33 owns the display (lpdemo-ctl lp leave first)")
+    try:
+        with open("/sys/power/mem_sleep") as f:
+            mem_sleep = f.read()
+    except OSError:
+        mem_sleep = ""
+    if "deep" not in mem_sleep:
+        raise shm.LpdemoError("no 'deep' in /sys/power/mem_sleep (%s): TF-A without "
+                              "PSCI SYSTEM_SUSPEND?" % mem_sleep.strip())
+    if "[deep]" not in mem_sleep:
+        with open("/sys/power/mem_sleep", "w") as f:
+            f.write("deep")
+
+    write_lp_layers(ctrl, args)
+    ctrl.write("auto_return_ms", 0)         # Step 2 return off: the wake-up returns
+    ctrl.write("sw3_wake", 1)
+    ctrl.write("susp_wake_ms", wake_ms)
+    ctrl.write("susp_mode", SUSPEND_MODES[mode] |
+               (shm.SUSP_MODE_PLAIN_WFI if plain_wfi else 0) |
+               (shm.SUSP_MODE_LATE_RETURN if late_return else 0) |
+               (shm.SUSP_MODE_DEBUG_UART if debug_uart else 0))
+    before = ctrl.snapshot()
+    t0 = boottime()
+    err = None
+    try:
+        with open("/sys/power/state", "w") as f:
+            f.write("mem")
+    except OSError as e:
+        err = e.strerror
+    t1 = boottime()
+    after = ctrl.snapshot()
+    info = {
+        "error": err,
+        "seconds": t1 - t0,
+        "slept": after["susp_count"] - before["susp_count"],
+        "woken": after["wake_count"] - before["wake_count"],
+        "result": after["susp_result_name"],
+        "bl31": after["bl31_stage_name"],
+        "wake": after["disp_wake_name"],
+        "pll4_us": after["pll4_us"],
+        "ddr_exit_us": after["ddr_exit_us"],
+        "underruns": after["und_count"] - before["und_count"],
+    }
+    ok = (err is None and info["slept"] == 1 and info["woken"] == 1 and
+          after["susp_result"] == 0 and after["bl31_stage"] == 0x3108 and
+          after["disp_state"] == shm.DISP_LINUX and info["underruns"] == 0)
+    return ok, info
+
+
+def describe_suspend(info):
+    if info["error"]:
+        return "suspend failed: %s (see dmesg)" % info["error"]
+    s = "back after %.1f s (%s)  BL31 %s  result %s" % (
+        info["seconds"], info["wake"], info["bl31"], info["result"])
+    if info["ddr_exit_us"] and info["slept"]:
+        s += "  PLL4 %d us  DDR exit %d us" % (info["pll4_us"], info["ddr_exit_us"])
+    if not info["slept"]:
+        s += "  [the CA55 did not reach the DISP_RET sleep]"
+    if info["underruns"]:
+        s += "  [%d WPF0 underruns]" % info["underruns"]
+    return s
+
+
+def default_mode():
+    mode = os.environ.get("LPDEMO_SUSPEND_MODE", "sleep")
+    return mode if mode in SUSPEND_MODES else "sleep"
+
+
+def suspend_debug_options(args):
+    if args.debug:
+        args.late_return = args.no_console_suspend = args.progress = True
+    if args.no_console_suspend:
+        with open("/sys/module/printk/parameters/console_suspend", "w") as f:
+            f.write("N")
+
+
+def cmd_suspend(ctrl, args):
+    suspend_debug_options(args)
+    ok, info = system_suspend(ctrl, args, args.mode or default_mode(), args.wake_ms,
+                              args.plain_wfi, args.late_return, args.no_console_suspend)
+    print(describe_suspend(info))
+    return 0 if ok else 1
+
+
+def cmd_suspend_cycle(ctrl, args):
+    suspend_debug_options(args)
+    mode = args.mode or default_mode()
+    err0 = kernel_errors()
+    ok_count = 0
+    t0 = time.monotonic()
+    try:
+        for i in range(1, args.count + 1):
+            ok, info = system_suspend(ctrl, args, mode, args.wake_ms, args.plain_wfi,
+                                      args.late_return, args.no_console_suspend)
+            if ok:
+                ok_count += 1
+            if not ok or i % 10 == 0 or i == args.count:
+                print("[%d/%d] %s %s" % (i, args.count, "ok" if ok else "FAIL",
+                                         describe_suspend(info)), flush=True)
+            if not ok and not args.keep_going:
+                break
+            time.sleep(args.gap_ms / 1000.0)
+    except KeyboardInterrupt:
+        print("interrupted")
+    finally:
+        ctrl.write("susp_wake_ms", 0)
+    kerr = kernel_errors() - err0
+    print("suspend-cycle (%s): %d ok of %d in %.0f s; kernel log errors %d" %
+          (mode, ok_count, args.count, time.monotonic() - t0, kerr))
+    return 0 if ok_count == args.count and kerr == 0 else 1
+
+
+def lp_picture_options(s):
+    s.add_argument("--baseline-mw", type=int, metavar="MW",
+                   help="normal mode power for the saving (default: current mean)")
+    s.add_argument("--no-readout", action="store_true",
+                   help="the CM33 does not redraw the power read-out")
+    s.add_argument("--progress", action="store_true",
+                   help="suspend progress bar at the bottom of RPF1 (debug)")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    p.add_argument("--wait", type=float, default=0, metavar="SEC",
+                   help="wait up to SEC seconds for the control block (UIO device)")
+    sub = p.add_subparsers(dest="cmd")
+    s = sub.add_parser("status", help="show the control block")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_status)
+    sub.add_parser("grant", help="hand RIIC0 over to the CM33").set_defaults(func=cmd_grant)
+    sub.add_parser("revoke", help="take RIIC0 back").set_defaults(func=cmd_revoke)
+    s = sub.add_parser("period", help="sampling period in ms (0 = default)")
+    s.add_argument("ms", type=int)
+    s.set_defaults(func=cmd_period)
+    s = sub.add_parser("watch", help="print new samples")
+    s.add_argument("-i", "--interval", type=float, default=0.1)
+    s.set_defaults(func=cmd_watch)
+
+    for name, func, hlp in (("suspend", cmd_suspend, "system suspend, display kept running"),
+                            ("suspend-cycle", cmd_suspend_cycle, "automatic suspends")):
+        s = sub.add_parser(name, help=hlp)
+        s.set_defaults(func=func)
+        if name == "suspend-cycle":
+            s.add_argument("count", type=int)
+            s.add_argument("--gap-ms", type=int, default=3000, help="time in Linux")
+            s.add_argument("--keep-going", action="store_true")
+        s.add_argument("--mode", choices=sorted(SUSPEND_MODES),
+                       help="sleep (3a, DDR active) or retention (3b); "
+                            "default $LPDEMO_SUSPEND_MODE or sleep")
+        s.add_argument("--plain-wfi", action="store_true",
+                       help="plain WFI instead of the Cortex-A55 Sleep Mode")
+        s.add_argument("--late-return", action="store_true",
+                       help="keep the LP picture until Linux takes the display back")
+        s.add_argument("--no-console-suspend", action="store_true",
+                       help="keep the kernel console on through the suspend")
+        s.add_argument("--debug", action="store_true",
+                       help="--late-return --no-console-suspend --progress")
+        s.add_argument("--wake-ms", type=int,
+                       default=0 if name == "suspend" else 2000,
+                       help="wake up after MS (0: USER_SW3 only)")
+        lp_picture_options(s)
+
+    lp = sub.add_parser("lp", help="display hand-over to the CM33")
+    lpsub = lp.add_subparsers(dest="lpcmd")
+    lp.set_defaults(func=cmd_lp_status)
+    lpsub.add_parser("status", help="hand-over state").set_defaults(func=cmd_lp_status)
+    lpsub.add_parser("samples", help="power samples of the last LP period").set_defaults(
+        func=cmd_lp_samples)
+    lpsub.add_parser("probe", help="frame timing probe of the last hand-over").set_defaults(
+        func=cmd_lp_probe)
+    for name, func, hlp in (("enter", cmd_lp_enter, "hand the display over to the CM33"),
+                            ("leave", cmd_lp_leave, "give the display back to Linux"),
+                            ("run", cmd_lp_run, "hand over, wait for USER_SW3, give back"),
+                            ("cycle", cmd_lp_cycle, "automatic round trips")):
+        s = lpsub.add_parser(name, help=hlp)
+        s.set_defaults(func=func)
+        s.add_argument("--no-stop", action="store_true",
+                       help="do not stop Weston (only for tests without a compositor)")
+        lp_picture_options(s)
+        if name == "run":
+            s.add_argument("--timeout", type=int, default=0,
+                           help="give the display back after SEC s without USER_SW3")
+        if name == "cycle":
+            s.add_argument("count", type=int)
+            s.add_argument("--hold-ms", type=int, default=500, help="LP period")
+            s.add_argument("--gap-ms", type=int, default=500, help="Linux period")
+            s.add_argument("--keep-going", action="store_true")
+    args = p.parse_args()
+    if not args.cmd:
+        args = p.parse_args(["status"])
+    deadline = time.monotonic() + args.wait
+    while True:
+        try:
+            ctrl = shm.Ctrl()
+            break
+        except shm.LpdemoError as e:
+            if time.monotonic() >= deadline:
+                print("lpdemo-ctl: %s" % e, file=sys.stderr)
+                return 2
+            time.sleep(0.1)
+    with ctrl:
+        try:
+            return args.func(ctrl, args)
+        except shm.LpdemoError as e:
+            print("lpdemo-ctl: %s" % e, file=sys.stderr)
+            return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

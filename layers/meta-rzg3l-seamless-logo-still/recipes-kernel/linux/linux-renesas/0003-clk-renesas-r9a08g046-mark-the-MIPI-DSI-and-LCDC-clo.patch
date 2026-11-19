@@ -1,0 +1,39 @@
+From 7e4475c8f1a1e16d0ec4a4a4e4054e63dd537e2c Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Wed, 5 Aug 2026 11:52:12 +0900
+Subject: [PATCH] clk: renesas: r9a08g046: mark the MIPI DSI and LCDC clocks
+ critical
+
+Nothing holds the display clocks between probe and the first commit, so
+clk_disable_unused() would gate them and stop the logo. Mark them
+critical. The LCDC must run for the boot logo anyway.
+
+Upstream-Status: Inappropriate [RZ/G3L boot logo, board specific]
+---
+ drivers/clk/renesas/r9a08g046-cpg.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/drivers/clk/renesas/r9a08g046-cpg.c b/drivers/clk/renesas/r9a08g046-cpg.c
+index 9d635ce5251f..421b5c39f787 100644
+--- a/drivers/clk/renesas/r9a08g046-cpg.c
++++ b/drivers/clk/renesas/r9a08g046-cpg.c
+@@ -817,6 +817,19 @@ static const unsigned int r9a08g046_crit_mod_clks[] __initconst = {
+ 	MOD_CLK_BASE + R9A08G046_GPIO_HCLK,
+ 	MOD_CLK_BASE + R9A08G046_WDT0_PCLK,
+ 	MOD_CLK_BASE + R9A08G046_DMAC_ACLK,
++	/*
++	 * Kept on for the seamless boot logo. Nothing holds them between the
++	 * driver probes and the first commit, so clk_disable_unused() would
++	 * gate them and set the VIDEO1 MSTOP bits.
++	 */
++	MOD_CLK_BASE + R9A08G046_MIPI_DSI_SYSCLK,
++	MOD_CLK_BASE + R9A08G046_MIPI_DSI_ACLK,
++	MOD_CLK_BASE + R9A08G046_MIPI_DSI_PCLK,
++	MOD_CLK_BASE + R9A08G046_MIPI_DSI_VCLK,
++	MOD_CLK_BASE + R9A08G046_MIPI_DSI_LPCLK,
++	MOD_CLK_BASE + R9A08G046_LCDC_CLK_A,
++	MOD_CLK_BASE + R9A08G046_LCDC_CLK_P,
++	MOD_CLK_BASE + R9A08G046_LCDC_CLK_D,
+ };
+ 
+ static const unsigned int r9a08g046_critical_resets[] = {

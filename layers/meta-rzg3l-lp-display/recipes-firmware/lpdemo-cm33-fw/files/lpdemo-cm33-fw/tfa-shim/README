@@ -1,0 +1,3 @@
+Replacement headers for compiling the TF-A DDR driver (plat/renesas/rz/soc/g3l/drivers/ddr
+and board/g3l_smarc/ddr_param_def_lpddr4.c, same sources as BL2) for the CM33.
+This directory comes first in the include path.

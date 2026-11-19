@@ -1,0 +1,158 @@
+From bbcc89c29f62db694e2845fcc7528aeceed43c4e Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Wed, 14 Oct 2026 17:33:22 +0900
+Subject: [PATCH 5/8] drm: rz-du: keep the display running through the system
+ suspend (LowPower Display demo)
+
+With the CM33 hand-over configured (renesas,lpdemo-ctrl), the system
+suspend hands the running display over to the CM33 instead of disabling
+it: the LCDC keeps scanning out from SRAM while the DDR is in
+self-refresh (DISP_RET), and the CM33 gives the display back before it
+wakes the CA55 up. The resume only takes the display back - no modeset.
+
+The suspend is refused when the CM33 does not take the display over.
+---
+ drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.c  | 28 +++++++++++++++++++
+ drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.h  |  1 +
+ .../gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.c   | 27 ++++++++++++++++--
+ .../gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.h   |  2 ++
+ 4 files changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.c b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.c
+index c7268509c93f..d5755d174d35 100644
+--- a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.c
++++ b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.c
+@@ -135,6 +135,25 @@ static const struct drm_driver rzg2l_du_driver = {
+ static int rzg2l_du_pm_suspend(struct device *dev)
+ {
+ 	struct rzg2l_du_device *rcdu = dev_get_drvdata(dev);
++	int ret;
++
++	/*
++	 * LowPower Display demo (DISP_RET): the display keeps running through the system
++	 * suspend, driven by the CM33 from SRAM. Hand it over instead of disabling it; the
++	 * CM33 gives it back before it wakes the CA55 up. Without the CM33 the suspend is
++	 * refused rather than leaving the panel without anybody to drive it.
++	 */
++	if (rzg2l_du_lpdemo_available(rcdu) && rcdu->crtcs[0].crtc.state->active) {
++		drm_kms_helper_poll_disable(&rcdu->ddev);
++		ret = rzg2l_du_lpdemo_enter_suspend(rcdu);
++		if (ret) {
++			drm_kms_helper_poll_enable(&rcdu->ddev);
++			dev_err(dev, "lpdemo: display hand-over failed (%d), suspend aborted\n", ret);
++			return ret;
++		}
++		rcdu->lpdemo_suspended = true;
++		return 0;
++	}
+ 
+ 	drm_mode_config_helper_suspend(&rcdu->ddev);
+ 	return 0;
+@@ -145,6 +164,15 @@ static int rzg2l_du_pm_resume(struct device *dev)
+ {
+ 	struct rzg2l_du_device *rcdu = dev_get_drvdata(dev);
+ 
++	if (rcdu->lpdemo_suspended) {
++		/* The CM33 has already given the running display back: just take it */
++		rcdu->lpdemo_suspended = false;
++		if (rzg2l_du_lpdemo_leave(rcdu))
++			dev_err(dev, "lpdemo: display not given back by the CM33\n");
++		drm_kms_helper_poll_enable(&rcdu->ddev);
++		return 0;
++	}
++
+ #if IS_ENABLED(CONFIG_DRM_I2C_ADV7511)
+ 	drm_helper_hpd_irq_event(&rcdu->ddev);
+ #endif
+diff --git a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.h b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.h
+index 4e349bc0b5ae..de8f7d4c317c 100644
+--- a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.h
++++ b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.h
+@@ -77,6 +77,7 @@ struct rzg2l_du_device {
+ 	struct drm_bridge *lvds[RZG2L_DU_MAX_LVDS];
+ 
+ 	struct rzg2l_du_lpdemo *lpdemo;		/* CM33 display hand-over */
++	bool lpdemo_suspended;			/* display handed over for the system suspend */
+ };
+ 
+ static inline struct rzg2l_du_device *to_rzg2l_du_device(struct drm_device *dev)
+diff --git a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.c b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.c
+index 9ee048ac2aba..b204414c0d76 100644
+--- a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.c
++++ b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.c
+@@ -48,6 +48,8 @@
+ #define LPDEMO_CM33_FAULT		0xee
+ #define LPDEMO_DISP_CMD_ENTER		1
+ #define LPDEMO_DISP_CMD_LEAVE		2
++/* ENTER for the system suspend: the CM33 keeps the display until the wake-up */
++#define LPDEMO_DISP_CMD_F_SUSPEND	0x100
+ #define LPDEMO_DISP_LINUX		0
+ #define LPDEMO_DISP_LP			1
+ 
+@@ -135,7 +137,7 @@ static int lp_wait_last_flip(struct drm_crtc *crtc)
+ 	return left ? 0 : -ETIMEDOUT;
+ }
+ 
+-int rzg2l_du_lpdemo_enter(struct rzg2l_du_device *rcdu)
++static int lp_enter(struct rzg2l_du_device *rcdu, u32 cmd)
+ {
+ 	struct rzg2l_du_lpdemo *lp = rcdu->lpdemo;
+ 	struct drm_device *ddev = &rcdu->ddev;
+@@ -174,7 +176,7 @@ int rzg2l_du_lpdemo_enter(struct rzg2l_du_device *rcdu)
+ 	lp->cm33 = true;
+ 	drm_crtc_vblank_off(crtc);
+ 
+-	ret = lp_command(lp, LPDEMO_DISP_CMD_ENTER, LPDEMO_ENTER_TIMEOUT_US);
++	ret = lp_command(lp, cmd, LPDEMO_ENTER_TIMEOUT_US);
+ 	if (ret == 0 && lp_rd(lp, LPDEMO_OFF_DISP_STATE) != LPDEMO_DISP_LP)
+ 		ret = -EIO;
+ 	if (ret) {
+@@ -195,6 +197,21 @@ int rzg2l_du_lpdemo_enter(struct rzg2l_du_device *rcdu)
+ 	return ret;
+ }
+ 
++/* Hand-over at run time (lp_display): the CM33 returns the display on USER_SW3 */
++int rzg2l_du_lpdemo_enter(struct rzg2l_du_device *rcdu)
++{
++	return lp_enter(rcdu, LPDEMO_DISP_CMD_ENTER);
++}
++
++/*
++ * Hand-over for the system suspend (DISP_RET): the CM33 gives the display back only when
++ * it wakes the CA55 up, after the DDR retention exit.
++ */
++int rzg2l_du_lpdemo_enter_suspend(struct rzg2l_du_device *rcdu)
++{
++	return lp_enter(rcdu, LPDEMO_DISP_CMD_ENTER | LPDEMO_DISP_CMD_F_SUSPEND);
++}
++
+ int rzg2l_du_lpdemo_leave(struct rzg2l_du_device *rcdu)
+ {
+ 	struct rzg2l_du_lpdemo *lp = rcdu->lpdemo;
+@@ -238,6 +255,12 @@ bool rzg2l_du_lpdemo_owned(struct rzg2l_du_device *rcdu)
+ 	return rcdu->lpdemo && READ_ONCE(rcdu->lpdemo->cm33);
+ }
+ 
++/* The hand-over is set up in the DT (the CM33 is checked when it is used) */
++bool rzg2l_du_lpdemo_available(struct rzg2l_du_device *rcdu)
++{
++	return rcdu->lpdemo != NULL;
++}
++
+ static ssize_t lp_display_show(struct device *dev, struct device_attribute *attr, char *buf)
+ {
+ 	struct rzg2l_du_device *rcdu = dev_get_drvdata(dev);
+diff --git a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.h b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.h
+index ab406651e042..67a167ca24f5 100644
+--- a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.h
++++ b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.h
+@@ -12,7 +12,9 @@ struct rzg2l_du_device;
+ 
+ int rzg2l_du_lpdemo_init(struct rzg2l_du_device *rcdu);
+ int rzg2l_du_lpdemo_enter(struct rzg2l_du_device *rcdu);
++int rzg2l_du_lpdemo_enter_suspend(struct rzg2l_du_device *rcdu);
+ int rzg2l_du_lpdemo_leave(struct rzg2l_du_device *rcdu);
+ bool rzg2l_du_lpdemo_owned(struct rzg2l_du_device *rcdu);
++bool rzg2l_du_lpdemo_available(struct rzg2l_du_device *rcdu);
+ 
+ #endif /* __RZG2L_DU_LPDEMO_H__ */

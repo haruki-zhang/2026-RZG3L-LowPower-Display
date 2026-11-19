@@ -1,0 +1,18 @@
+From a5b7965cd8671a25d5149198f71334cef7c19be0 Mon Sep 17 00:00:00 2001
+From: Shinji Hirai <shinji.hirai.zn@renesas.com>
+Date: Mon, 3 Aug 2026 07:53:48 +0900
+Subject: [PATCH] configs:smarc-rzg3l:add CONFIG_VIDEO=y
+
+---
+ configs/smarc-rzg3l_defconfig | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/configs/smarc-rzg3l_defconfig b/configs/smarc-rzg3l_defconfig
+index efde421f2e..fa20afce06 100644
+--- a/configs/smarc-rzg3l_defconfig
++++ b/configs/smarc-rzg3l_defconfig
+@@ -100,3 +100,4 @@ CONFIG_SPI_FLASH_STMICRO=y
+ CONFIG_DM_SPI_FLASH=y
+ CONFIG_MTD=y
+ CONFIG_BOARD_LATE_INIT=y
++CONFIG_VIDEO=y

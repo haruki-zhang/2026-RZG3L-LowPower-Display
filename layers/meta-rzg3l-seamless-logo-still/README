@@ -1,0 +1,46 @@
+meta-rzg3l-seamless-logo-still
+==============================
+
+Seamless still logo for the RZ/G3L SMARC EVK. U-Boot shows a logo shortly
+after power-on. The kernel takes over the running display instead of resetting
+it. The logo stays on screen until Weston draws its first frame.
+
+Tested with RZ/G3L BSP v1.0.0, MACHINE = "smarc-rzg3l", core-image-weston.
+
+
+I. Changes
+==========
+
+  U-Boot    A display driver brings up HDMI and shows the logo from /boot
+            (1280x720).
+  Kernel    The logo memory is reserved. The display drivers take over the
+            running display. The framebuffer console and fbdev emulation are
+            disabled.
+  Image     The logo files are installed into /boot: the Renesas wordmark,
+            white on Renesas blue, rendered at 1280x720 and 1920x1080.
+
+
+II. Build
+=========
+
+Start from the default BSP build environment (RZ/G3L Linux Start-up Guide,
+2.2) and add the layer:
+
+  $ bitbake-layers add-layer ../meta-rzg3l-seamless-logo-still
+
+Build:
+
+  $ MACHINE=smarc-rzg3l bitbake core-image-weston
+
+
+III. Notes
+==========
+
+  - Cannot be combined with meta-rzg3l-seamless-logo-sequence.
+  - With meta-rzg3l-fast-boot: add meta-rzg3l-fast-boot first.
+    Both layers patch the same device tree file, in bblayers.conf order.
+  - The logo files are gzip-compressed raw ARGB8888 frame buffers, in
+    recipes-graphics/rzg3l-seamless-logo-still-image/files. To change the
+    resolution, DISPLAY_MODE in U-Boot patch 0002 and
+    renesas,seamless-boot-logo-vic in kernel patch 0008 must match
+    (MIPI_DSI_720P: 4, MIPI_DSI_1080P: 16).

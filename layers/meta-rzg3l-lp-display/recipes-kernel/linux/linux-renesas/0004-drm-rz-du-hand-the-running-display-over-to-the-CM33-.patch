@@ -1,0 +1,461 @@
+From b55471f21dd5031d5001c17bfec7c65dcdf953f1 Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Wed, 14 Oct 2026 15:26:46 +0900
+Subject: [PATCH 4/8] drm: rz-du: hand the running display over to the CM33
+ (LowPower Display demo)
+
+The CM33 firmware of the RZ/G3L LowPower Display demo can drive the
+running VSPD from a display list in on-chip SRAM, so that the LCDC does
+not read DDR any more. Add the Linux side of the hand-over:
+
+- lp_display (sysfs, "linux" | "cm33"): rzg2l_du_lpdemo_enter() waits
+  for the last page flip, turns the vblank off and asks the CM33 to take
+  the display over through the shared control block;
+  rzg2l_du_lpdemo_leave() asks for (or acknowledges) the return and turns
+  the vblank back on.
+- While the CM33 owns the display, atomic_check refuses every commit
+  with -EBUSY.
+
+User space has to stop the compositor first. The same functions are used
+by the system suspend path in the next step.
+---
+ drivers/gpu/drm/renesas/rz-du/Makefile        |   1 +
+ drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.c  |   6 +
+ drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.h  |   4 +
+ drivers/gpu/drm/renesas/rz-du/rzg2l_du_kms.c  |  13 +-
+ .../gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.c   | 309 ++++++++++++++++++
+ .../gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.h   |  18 +
+ 6 files changed, 350 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.c
+ create mode 100644 drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.h
+
+diff --git a/drivers/gpu/drm/renesas/rz-du/Makefile b/drivers/gpu/drm/renesas/rz-du/Makefile
+index 5cf192bb1012..4883f5921b6a 100644
+--- a/drivers/gpu/drm/renesas/rz-du/Makefile
++++ b/drivers/gpu/drm/renesas/rz-du/Makefile
+@@ -3,6 +3,7 @@ rzg2l-du-drm-y := rzg2l_du_crtc.o \
+ 		  rzg2l_du_drv.o \
+ 		  rzg2l_du_encoder.o \
+ 		  rzg2l_du_kms.o \
++		  rzg2l_du_lpdemo.o \
+ 
+ rzg2l-du-drm-$(CONFIG_VIDEO_RENESAS_VSP1)	+= rzg2l_du_vsp.o
+ obj-$(CONFIG_DRM_RZG2L_DU)		+= rzg2l-du-drm.o
+diff --git a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.c b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.c
+index a2c5447a282e..c7268509c93f 100644
+--- a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.c
++++ b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.c
+@@ -20,6 +20,7 @@
+ 
+ #include "rzg2l_du_drv.h"
+ #include "rzg2l_du_kms.h"
++#include "rzg2l_du_lpdemo.h"
+ 
+ /* -----------------------------------------------------------------------------
+  * Device Information
+@@ -230,6 +231,11 @@ static int rzg2l_du_probe(struct platform_device *pdev)
+ 
+ 	drm_info(&rcdu->ddev, "Device %s probed\n", dev_name(&pdev->dev));
+ 
++	/* The display keeps working without the hand-over to the CM33 */
++	ret = rzg2l_du_lpdemo_init(rcdu);
++	if (ret)
++		dev_warn(&pdev->dev, "lpdemo: hand-over not available (%d)\n", ret);
++
+ 	drm_fbdev_dma_setup(&rcdu->ddev, 32);
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.h b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.h
+index 5173a4559a75..4e349bc0b5ae 100644
+--- a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.h
++++ b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_drv.h
+@@ -60,6 +60,8 @@ struct rzg2l_du_device_info {
+ #define RZG2L_DU_MAX_DSI		1
+ #define RZG2L_DU_MAX_LVDS		1
+ 
++struct rzg2l_du_lpdemo;
++
+ struct rzg2l_du_device {
+ 	struct device *dev;
+ 	const struct rzg2l_du_device_info *info;
+@@ -73,6 +75,8 @@ struct rzg2l_du_device {
+ 
+ 	struct rzg2l_du_vsp vsps[RZG2L_DU_MAX_VSPS];
+ 	struct drm_bridge *lvds[RZG2L_DU_MAX_LVDS];
++
++	struct rzg2l_du_lpdemo *lpdemo;		/* CM33 display hand-over */
+ };
+ 
+ static inline struct rzg2l_du_device *to_rzg2l_du_device(struct drm_device *dev)
+diff --git a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_kms.c b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_kms.c
+index 55a97691e9b2..0630a040f9cc 100644
+--- a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_kms.c
++++ b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_kms.c
+@@ -28,6 +28,7 @@
+ #include "rzg2l_du_drv.h"
+ #include "rzg2l_du_encoder.h"
+ #include "rzg2l_du_kms.h"
++#include "rzg2l_du_lpdemo.h"
+ #include "rzg2l_du_vsp.h"
+ 
+ /* -----------------------------------------------------------------------------
+@@ -225,9 +226,19 @@ static const struct drm_mode_config_helper_funcs rzg2l_du_mode_config_helper = {
+ 	.atomic_commit_tail = drm_atomic_helper_commit_tail_rpm,
+ };
+ 
++static int rzg2l_du_atomic_check(struct drm_device *dev,
++				 struct drm_atomic_state *state)
++{
++	/* The CM33 owns the VSPD (LowPower Display demo): no commit may touch it */
++	if (rzg2l_du_lpdemo_owned(to_rzg2l_du_device(dev)))
++		return -EBUSY;
++
++	return drm_atomic_helper_check(dev, state);
++}
++
+ static const struct drm_mode_config_funcs rzg2l_du_mode_config_funcs = {
+ 	.fb_create = rzg2l_du_fb_create,
+-	.atomic_check = drm_atomic_helper_check,
++	.atomic_check = rzg2l_du_atomic_check,
+ 	.atomic_commit = drm_atomic_helper_commit,
+ };
+ 
+diff --git a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.c b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.c
+new file mode 100644
+index 000000000000..9ee048ac2aba
+--- /dev/null
++++ b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.c
+@@ -0,0 +1,309 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * RZ/G3L LowPower Display demo: hand the running display over to the CM33.
++ *
++ * The CM33 firmware switches the running VSPD to a display list in on-chip SRAM (LP
++ * picture) and back to the Linux display list, through a control block in SRAM
++ * (struct lpdemo_ctrl in lpdemo_shared.h of the CM33 firmware). While the CM33 owns the
++ * display, Linux must not touch the VSPD: no atomic commit is accepted and the vblank
++ * interrupt is off (the CM33 masks the WPF0 interrupts).
++ *
++ * Userspace must stop the compositor before the hand-over (Step 2: SIGSTOP; Step 3: the
++ * system suspend freezer), so that no page flip is pending for the whole LP period.
++ *
++ * sysfs: /sys/devices/platform/.../lp_display  "linux" | "cm33"
++ */
++
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/sysfs.h>
++
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_crtc.h>
++#include <drm/drm_modeset_lock.h>
++#include <drm/drm_print.h>
++#include <drm/drm_vblank.h>
++
++#include "rzg2l_du_drv.h"
++#include "rzg2l_du_lpdemo.h"
++
++/* struct lpdemo_ctrl (lpdemo_shared.h, version 4; the fields used here are those of v3) */
++#define LPDEMO_MAGIC			0x4344504C	/* "LPDC" */
++#define LPDEMO_VERSION			4
++#define LPDEMO_OFF_MAGIC		0x00
++#define LPDEMO_OFF_VERSION		0x04
++#define LPDEMO_OFF_CM33_STATE		0x10
++#define LPDEMO_OFF_HEARTBEAT		0x14
++#define LPDEMO_OFF_DISP_CMD		0x80
++#define LPDEMO_OFF_DISP_REQ_SEQ		0x84
++#define LPDEMO_OFF_DISP_ACK_SEQ		0xa0
++#define LPDEMO_OFF_DISP_RESULT		0xa4
++#define LPDEMO_OFF_DISP_STATE		0xa8
++#define LPDEMO_CTRL_SIZE		0xe0
++
++#define LPDEMO_CM33_FAULT		0xee
++#define LPDEMO_DISP_CMD_ENTER		1
++#define LPDEMO_DISP_CMD_LEAVE		2
++#define LPDEMO_DISP_LINUX		0
++#define LPDEMO_DISP_LP			1
++
++/* The CM33 polls every 10 ms; a switch takes up to two frames (two switches to leave) */
++#define LPDEMO_ENTER_TIMEOUT_US		(200 * USEC_PER_MSEC)
++#define LPDEMO_LEAVE_TIMEOUT_US		(300 * USEC_PER_MSEC)
++#define LPDEMO_FLIP_TIMEOUT_MS		500
++
++struct rzg2l_du_lpdemo {
++	struct rzg2l_du_device *rcdu;
++	void __iomem *ctrl;
++	struct mutex lock;		/* serialises enter/leave */
++	bool cm33;			/* the CM33 owns the display */
++};
++
++static u32 lp_rd(struct rzg2l_du_lpdemo *lp, unsigned int off)
++{
++	return readl(lp->ctrl + off);
++}
++
++static void lp_wr(struct rzg2l_du_lpdemo *lp, unsigned int off, u32 val)
++{
++	writel(val, lp->ctrl + off);
++}
++
++static int lp_check_cm33(struct rzg2l_du_lpdemo *lp)
++{
++	struct drm_device *ddev = &lp->rcdu->ddev;
++
++	if (lp_rd(lp, LPDEMO_OFF_MAGIC) != LPDEMO_MAGIC ||
++	    lp_rd(lp, LPDEMO_OFF_VERSION) != LPDEMO_VERSION) {
++		drm_err(ddev, "lpdemo: CM33 control block not initialised (magic %08x version %u)\n",
++			lp_rd(lp, LPDEMO_OFF_MAGIC), lp_rd(lp, LPDEMO_OFF_VERSION));
++		return -ENODEV;
++	}
++	if (lp_rd(lp, LPDEMO_OFF_CM33_STATE) == LPDEMO_CM33_FAULT) {
++		drm_err(ddev, "lpdemo: CM33 firmware in fault state\n");
++		return -EIO;
++	}
++	return 0;
++}
++
++/* Runs one hand-over command on the CM33. Returns the CM33 result (0 = OK) or -errno. */
++static int lp_command(struct rzg2l_du_lpdemo *lp, u32 cmd, unsigned long timeout_us)
++{
++	struct drm_device *ddev = &lp->rcdu->ddev;
++	u32 seq = lp_rd(lp, LPDEMO_OFF_DISP_REQ_SEQ) + 1;
++	u32 ack;
++	int ret;
++
++	lp_wr(lp, LPDEMO_OFF_DISP_CMD, cmd);
++	wmb();
++	lp_wr(lp, LPDEMO_OFF_DISP_REQ_SEQ, seq);
++
++	ret = readl_poll_timeout(lp->ctrl + LPDEMO_OFF_DISP_ACK_SEQ, ack, ack == seq,
++				 1000, timeout_us);
++	if (ret) {
++		drm_err(ddev, "lpdemo: CM33 did not answer command %u (heartbeat %u)\n",
++			cmd, lp_rd(lp, LPDEMO_OFF_HEARTBEAT));
++		return ret;
++	}
++	rmb();
++	return lp_rd(lp, LPDEMO_OFF_DISP_RESULT);
++}
++
++/* Waits for the flip of the last committed state of the CRTC. */
++static int lp_wait_last_flip(struct drm_crtc *crtc)
++{
++	struct drm_crtc_commit *commit;
++	long left = 1;
++
++	spin_lock(&crtc->commit_lock);
++	commit = list_first_entry_or_null(&crtc->commit_list, struct drm_crtc_commit,
++					  commit_entry);
++	if (commit)
++		drm_crtc_commit_get(commit);
++	spin_unlock(&crtc->commit_lock);
++
++	if (!commit)
++		return 0;
++
++	left = wait_for_completion_timeout(&commit->flip_done,
++					   msecs_to_jiffies(LPDEMO_FLIP_TIMEOUT_MS));
++	drm_crtc_commit_put(commit);
++	return left ? 0 : -ETIMEDOUT;
++}
++
++int rzg2l_du_lpdemo_enter(struct rzg2l_du_device *rcdu)
++{
++	struct rzg2l_du_lpdemo *lp = rcdu->lpdemo;
++	struct drm_device *ddev = &rcdu->ddev;
++	struct drm_crtc *crtc = &rcdu->crtcs[0].crtc;
++	int ret;
++
++	if (!lp)
++		return -ENODEV;
++
++	mutex_lock(&lp->lock);
++	if (lp->cm33) {
++		ret = 0;
++		goto out;
++	}
++	ret = lp_check_cm33(lp);
++	if (ret)
++		goto out;
++
++	/* No new commit can start while we hold all modeset locks */
++	drm_modeset_lock_all(ddev);
++
++	if (!crtc->state->active) {
++		drm_err(ddev, "lpdemo: CRTC is not active\n");
++		ret = -EINVAL;
++		goto unlock;
++	}
++
++	/* The last commit may still be in flight (non-blocking commit) */
++	ret = lp_wait_last_flip(crtc);
++	if (ret) {
++		drm_err(ddev, "lpdemo: page flip still pending\n");
++		goto unlock;
++	}
++
++	/* From here on atomic_check refuses every commit (rzg2l_du_atomic_check()) */
++	lp->cm33 = true;
++	drm_crtc_vblank_off(crtc);
++
++	ret = lp_command(lp, LPDEMO_DISP_CMD_ENTER, LPDEMO_ENTER_TIMEOUT_US);
++	if (ret == 0 && lp_rd(lp, LPDEMO_OFF_DISP_STATE) != LPDEMO_DISP_LP)
++		ret = -EIO;
++	if (ret) {
++		if (ret > 0) {
++			drm_err(ddev, "lpdemo: CM33 refused the hand-over (result %d)\n", ret);
++			ret = -EIO;
++		}
++		drm_crtc_vblank_on(crtc);
++		lp->cm33 = false;
++		goto unlock;
++	}
++	drm_dbg_kms(ddev, "lpdemo: display handed over to the CM33\n");
++
++unlock:
++	drm_modeset_unlock_all(ddev);
++out:
++	mutex_unlock(&lp->lock);
++	return ret;
++}
++
++int rzg2l_du_lpdemo_leave(struct rzg2l_du_device *rcdu)
++{
++	struct rzg2l_du_lpdemo *lp = rcdu->lpdemo;
++	struct drm_device *ddev = &rcdu->ddev;
++	struct drm_crtc *crtc = &rcdu->crtcs[0].crtc;
++	int ret;
++
++	if (!lp)
++		return -ENODEV;
++
++	mutex_lock(&lp->lock);
++	if (!lp->cm33) {
++		ret = 0;
++		goto out;
++	}
++
++	/* Also acknowledged at once when the CM33 has already returned (USER_SW3, timer) */
++	ret = lp_command(lp, LPDEMO_DISP_CMD_LEAVE, LPDEMO_LEAVE_TIMEOUT_US);
++	if (ret == 0 && lp_rd(lp, LPDEMO_OFF_DISP_STATE) != LPDEMO_DISP_LINUX)
++		ret = -EIO;
++	if (ret) {
++		/* The LP display list may still be active: keep Linux off the VSPD */
++		drm_err(ddev, "lpdemo: CM33 did not give the display back (%d)\n", ret);
++		ret = ret > 0 ? -EIO : ret;
++		goto out;
++	}
++
++	drm_modeset_lock_all(ddev);
++	drm_crtc_vblank_on(crtc);
++	lp->cm33 = false;
++	drm_modeset_unlock_all(ddev);
++	drm_dbg_kms(ddev, "lpdemo: display back to Linux\n");
++
++out:
++	mutex_unlock(&lp->lock);
++	return ret;
++}
++
++bool rzg2l_du_lpdemo_owned(struct rzg2l_du_device *rcdu)
++{
++	return rcdu->lpdemo && READ_ONCE(rcdu->lpdemo->cm33);
++}
++
++static ssize_t lp_display_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct rzg2l_du_device *rcdu = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%s\n", rzg2l_du_lpdemo_owned(rcdu) ? "cm33" : "linux");
++}
++
++static ssize_t lp_display_store(struct device *dev, struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	struct rzg2l_du_device *rcdu = dev_get_drvdata(dev);
++	int ret;
++
++	if (sysfs_streq(buf, "cm33"))
++		ret = rzg2l_du_lpdemo_enter(rcdu);
++	else if (sysfs_streq(buf, "linux"))
++		ret = rzg2l_du_lpdemo_leave(rcdu);
++	else
++		ret = -EINVAL;
++
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_RW(lp_display);
++
++static struct attribute *lp_attrs[] = {
++	&dev_attr_lp_display.attr,
++	NULL
++};
++
++static const struct attribute_group lp_group = {
++	.attrs = lp_attrs,
++};
++
++int rzg2l_du_lpdemo_init(struct rzg2l_du_device *rcdu)
++{
++	struct device *dev = rcdu->dev;
++	struct rzg2l_du_lpdemo *lp;
++	struct device_node *np;
++	struct resource res;
++	int ret;
++
++	np = of_parse_phandle(dev->of_node, "renesas,lpdemo-ctrl", 0);
++	if (!np)
++		return 0;
++	ret = of_address_to_resource(np, 0, &res);
++	of_node_put(np);
++	if (ret)
++		return ret;
++	if (resource_size(&res) < LPDEMO_CTRL_SIZE)
++		return -EINVAL;
++
++	lp = devm_kzalloc(dev, sizeof(*lp), GFP_KERNEL);
++	if (!lp)
++		return -ENOMEM;
++	/* Shared with the UIO device of the control block: do not request the region */
++	lp->ctrl = devm_ioremap(dev, res.start, LPDEMO_CTRL_SIZE);
++	if (!lp->ctrl)
++		return -ENOMEM;
++	lp->rcdu = rcdu;
++	mutex_init(&lp->lock);
++	rcdu->lpdemo = lp;
++
++	ret = devm_device_add_group(dev, &lp_group);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "lpdemo: CM33 display hand-over at %pa\n", &res.start);
++	return 0;
++}
+diff --git a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.h b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.h
+new file mode 100644
+index 000000000000..ab406651e042
+--- /dev/null
++++ b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_lpdemo.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * RZ/G3L LowPower Display demo: hand the running display over to the CM33.
++ */
++
++#ifndef __RZG2L_DU_LPDEMO_H__
++#define __RZG2L_DU_LPDEMO_H__
++
++#include <linux/types.h>
++
++struct rzg2l_du_device;
++
++int rzg2l_du_lpdemo_init(struct rzg2l_du_device *rcdu);
++int rzg2l_du_lpdemo_enter(struct rzg2l_du_device *rcdu);
++int rzg2l_du_lpdemo_leave(struct rzg2l_du_device *rcdu);
++bool rzg2l_du_lpdemo_owned(struct rzg2l_du_device *rcdu);
++
++#endif /* __RZG2L_DU_LPDEMO_H__ */

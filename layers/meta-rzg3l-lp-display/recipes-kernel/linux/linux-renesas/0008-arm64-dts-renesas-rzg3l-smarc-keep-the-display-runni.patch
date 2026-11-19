@@ -1,0 +1,48 @@
+From 3f6052e7f8a1db2b5570ee36873beb4f362e0bed Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Wed, 14 Oct 2026 17:34:44 +0900
+Subject: [PATCH] arm64: dts: renesas: rzg3l-smarc: keep the display running
+ through the system suspend (LowPower Display demo)
+
+- Mark the VSPD and the MIPI DSI with renesas,lpdemo-keep-running: the DU
+  hands the running display over to the CM33 for the DISP_RET system
+  suspend, their system sleep callbacks must leave the hardware alone.
+- Map the DDR retention CSR snapshot and the suspend trace of the SRAM
+  (0x5A000) as UIO map 2, for the post-mortem of a hang.
+---
+ .../boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi  | 22 +++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi b/arch/arm64/boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi
+index a74138fbec00..f85af1903cfe 100644
+--- a/arch/arm64/boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi
++++ b/arch/arm64/boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi
+@@ -31,6 +31,28 @@ &du {
+ 	renesas,lpdemo-ctrl = <&lpdemo_ctrl>;
+ };
+ 
++/*
++ * DISP_RET system suspend: the display pipeline keeps running (the DU hands it over to the
++ * CM33), the system sleep callbacks of the VSPD and of the DSI must not stop or reset it.
++ */
++&vspd {
++	renesas,lpdemo-keep-running;
++};
++
++/*
++ * UIO map 2: DDR retention CSR snapshot (BL2 -> CM33) and the trace of the last suspend,
++ * kept across a reset (read by lpdemo-ctl for the post-mortem of a hang).
++ */
++&lpdemo_ctrl {
++	reg = <0x0 0x5b000 0x0 0x1000>,
++	      <0x0 0x5e000 0x0 0x36000>,
++	      <0x0 0x5a000 0x0 0x1000>;
++};
++
++&dsi {
++	renesas,lpdemo-keep-running;
++};
++
+ /*
+  * USER_SW3 (SMARC GPIO7 -> IC31 -> P65, active low, no external pull-up) wakes the
+  * display from the CM33 side: the CM33 polls the pin. Linux owns the pin controller and

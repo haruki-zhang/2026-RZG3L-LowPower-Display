@@ -1,0 +1,60 @@
+From 0a2c3c383e151584d2f5058fa5020ebc08269699 Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Wed, 5 Aug 2026 11:51:47 +0900
+Subject: [PATCH] arm64: dts: renesas: rzg3l-smarc: declare the boot logo
+ display hand-over
+
+Tell the display drivers to inherit the display U-Boot started, instead
+of resetting it. Drop the ADV7535 interrupt: the connector is pinned, so
+a hot-plug event would only re-probe the bridge.
+
+Upstream-Status: Inappropriate [RZ/G3L boot logo, board specific]
+---
+ .../boot/dts/renesas/r9a08g046l48-smarc.dts   | 20 ++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/renesas/r9a08g046l48-smarc.dts b/arch/arm64/boot/dts/renesas/r9a08g046l48-smarc.dts
+index 03a5863ac94c..878e0c5ab212 100644
+--- a/arch/arm64/boot/dts/renesas/r9a08g046l48-smarc.dts
++++ b/arch/arm64/boot/dts/renesas/r9a08g046l48-smarc.dts
+@@ -596,13 +596,25 @@ channel1 {
+ };
+ 
+ #if (RZG3L_SMARC_MIPI_DSI_ENABLE)
++/*
++ * U-Boot started the display. "renesas,seamless-boot-logo" makes each driver
++ * inherit it on the first modeset instead of resetting it.
++ */
++&vspd {
++	renesas,seamless-boot-logo;
++};
++
+ &du {
+ 	status = "okay";
++
++	renesas,seamless-boot-logo;
+ };
+ 
+ &dsi {
+ 	status = "okay";
+ 
++	renesas,seamless-boot-logo;
++
+ 	ports {
+ 		port@1 {
+ 			dsi0_out: endpoint {
+@@ -619,7 +631,13 @@ adv7535: hdmi@3d {
+ 		reg = <0x3d>, <0x2d>, <0x4d>, <0x5d>;
+ 		reg-names = "main", "cec", "edid", "packet";
+ 
+-		interrupts-extended = <&pinctrl RZG3L_GPIO(K, 3) IRQ_TYPE_EDGE_FALLING>;
++		renesas,seamless-boot-logo;
++
++		/*
++		 * No interrupts-extended: the connector is pinned to the U-Boot
++		 * mode and always connected. Hotplug would only re-probe the
++		 * bridge.
++		 */
+ 		clocks = <&osc1>;
+ 		clock-names = "cec";
+ 		avdd-supply = <&reg_1p8v>;

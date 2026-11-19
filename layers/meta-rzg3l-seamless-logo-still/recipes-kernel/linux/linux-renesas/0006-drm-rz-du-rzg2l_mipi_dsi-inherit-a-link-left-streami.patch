@@ -1,0 +1,166 @@
+From 3624793e7e8a1c376044d195b3b978102853c6f8 Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Wed, 5 Aug 2026 11:56:43 +0900
+Subject: [PATCH] drm: rz-du: rzg2l_mipi_dsi: inherit a link left streaming by
+ the bootloader
+
+Probe powers the D-PHY off, and the first enable re-locks PLL7 and
+restarts the link. Skip both while the hand-over is pending, and hold a
+runtime PM reference, so the suspend does not reset the live link.
+
+Upstream-Status: Inappropriate [RZ/G3L boot logo, board specific]
+---
+ .../gpu/drm/renesas/rz-du/rzg2l_mipi_dsi.c    | 76 +++++++++++++++++--
+ 1 file changed, 70 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/renesas/rz-du/rzg2l_mipi_dsi.c b/drivers/gpu/drm/renesas/rz-du/rzg2l_mipi_dsi.c
+index 4815222f8644..4ad1e1b1cfa5 100644
+--- a/drivers/gpu/drm/renesas/rz-du/rzg2l_mipi_dsi.c
++++ b/drivers/gpu/drm/renesas/rz-du/rzg2l_mipi_dsi.c
+@@ -89,8 +89,25 @@ struct rzg2l_mipi_dsi {
+ 	/* DCS buffer pointers when using external memory. */
+ 	dma_addr_t dcs_buf_phys;
+ 	u8 *dcs_buf_virt;
++
++	/*
++	 * From "renesas,seamless-boot-logo": the bootloader's link is still
++	 * streaming. A runtime PM reference is held while it is set, so the DSI
++	 * resets stay deasserted.
++	 */
++	bool boot_logo_handover;
+ };
+ 
++/* Release the hand-over reference. Safe to call more than once. */
++static void rzg2l_mipi_dsi_finish_handover(struct rzg2l_mipi_dsi *dsi)
++{
++	if (!dsi->boot_logo_handover)
++		return;
++
++	dsi->boot_logo_handover = false;
++	pm_runtime_put(dsi->dev);
++}
++
+ static inline struct rzg2l_mipi_dsi *
+ bridge_to_rzg2l_mipi_dsi(struct drm_bridge *bridge)
+ {
+@@ -438,6 +455,14 @@ static int rzg2l_mipi_dsi_startup(struct rzg2l_mipi_dsi *dsi,
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/*
++	 * The link already runs with these settings. Reprogramming would
++	 * re-lock PLL7 and power-cycle the D-PHY, which drops the HS link. The
++	 * PM reference above stays, to keep get and put paired.
++	 */
++	if (dsi->boot_logo_handover)
++		return 0;
++
+ 	ret = dsi->info->dphy_conf_clks(dsi, mode->clock, &hsfreq_millihz);
+ 	if (ret < 0)
+ 		goto err_phy;
+@@ -733,6 +758,12 @@ static void rzg2l_mipi_dsi_atomic_enable(struct drm_bridge *bridge,
+ 	struct drm_crtc *crtc;
+ 	int ret;
+ 
++	/* Restarting the HS clock or the video input makes the sink re-sync. */
++	if (dsi->boot_logo_handover) {
++		rzg2l_mipi_dsi_finish_handover(dsi);
++		return;
++	}
++
+ 	ret = rzg2l_mipi_dsi_start_hs_clock(dsi);
+ 	if (ret < 0)
+ 		goto err_stop;
+@@ -763,6 +794,12 @@ static void rzg2l_mipi_dsi_atomic_disable(struct drm_bridge *bridge,
+ 	rzg2l_mipi_dsi_stop_video(dsi);
+ 	rzg2l_mipi_dsi_stop_hs_clock(dsi);
+ 	rzg2l_mipi_dsi_stop(dsi);
++
++	/*
++	 * Release the hand-over reference after the stop sequence. The device
++	 * must not suspend, and assert its resets, while the sequence runs.
++	 */
++	rzg2l_mipi_dsi_finish_handover(dsi);
+ }
+ 
+ static enum drm_mode_status
+@@ -1199,24 +1236,48 @@ static int rzg2l_mipi_dsi_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, dsi);
+ 
++	dsi->boot_logo_handover =
++		of_property_read_bool(dsi->dev->of_node,
++				      "renesas,seamless-boot-logo");
++
+ 	pm_runtime_enable(dsi->dev);
+ 
++	if (dsi->boot_logo_handover) {
++		/*
++		 * Keep the device resumed. Otherwise the put below suspends it,
++		 * and the suspend asserts MIPI_DSI_ARESET_N/PRESET_N under the
++		 * running link.
++		 */
++		ret = pm_runtime_resume_and_get(dsi->dev);
++		if (ret < 0) {
++			dsi->boot_logo_handover = false;
++			goto err_pm_disable;
++		}
++	}
++
+ 	ret = pm_runtime_resume_and_get(dsi->dev);
+ 	if (ret < 0)
+-		goto err_pm_disable;
++		goto err_handover_put;
+ 
+ 	/*
+ 	 * TXSETR register can be read only after DPHY init. But during probe
+ 	 * mode->clock and format are not available. So initialize DPHY with
+ 	 * timing parameters for 80Mbps.
++	 *
++	 * During a boot logo hand-over the D-PHY already runs the real mode.
++	 * Re-initialising it, and powering it off in dphy_exit(), would stop
++	 * the link. Read TXSETR directly.
+ 	 */
+-	ret = dsi->info->dphy_init(dsi, 80000000ULL * MILLI);
+-	if (ret < 0)
+-		goto err_phy;
++	if (!dsi->boot_logo_handover) {
++		ret = dsi->info->dphy_init(dsi, 80000000ULL * MILLI);
++		if (ret < 0)
++			goto err_phy;
++	}
+ 
+ 	txsetr = rzg2l_mipi_dsi_link_read(dsi, TXSETR);
+ 	dsi->num_data_lanes = min(((txsetr >> 16) & 3) + 1, num_data_lanes);
+-	dsi->info->dphy_exit(dsi);
++	if (!dsi->boot_logo_handover)
++		dsi->info->dphy_exit(dsi);
+ 	pm_runtime_put(dsi->dev);
+ 
+ 	/* Initialize the DRM bridge. */
+@@ -1228,7 +1289,7 @@ static int rzg2l_mipi_dsi_probe(struct platform_device *pdev)
+ 	dsi->host.ops = &rzg2l_mipi_dsi_host_ops;
+ 	ret = mipi_dsi_host_register(&dsi->host);
+ 	if (ret < 0)
+-		goto err_pm_disable;
++		goto err_handover_put;
+ 
+ 	dsi->dcs_buf_virt = dma_alloc_coherent(dsi->host.dev, RZG2L_DCS_BUF_SIZE,
+ 					       &dsi->dcs_buf_phys, GFP_KERNEL);
+@@ -1240,6 +1301,8 @@ static int rzg2l_mipi_dsi_probe(struct platform_device *pdev)
+ err_phy:
+ 	dsi->info->dphy_exit(dsi);
+ 	pm_runtime_put(dsi->dev);
++err_handover_put:
++	rzg2l_mipi_dsi_finish_handover(dsi);
+ err_pm_disable:
+ 	pm_runtime_disable(dsi->dev);
+ 	return ret;
+@@ -1252,6 +1315,7 @@ static void rzg2l_mipi_dsi_remove(struct platform_device *pdev)
+ 	dma_free_coherent(dsi->host.dev, RZG2L_DCS_BUF_SIZE, dsi->dcs_buf_virt,
+ 			  dsi->dcs_buf_phys);
+ 	mipi_dsi_host_unregister(&dsi->host);
++	rzg2l_mipi_dsi_finish_handover(dsi);
+ 	pm_runtime_disable(&pdev->dev);
+ }
+ 

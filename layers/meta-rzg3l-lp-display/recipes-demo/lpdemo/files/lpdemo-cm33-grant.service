@@ -1,0 +1,14 @@
+[Unit]
+Description=LowPower Display Demo: hand RIIC0 (I2C_PM) over to the CM33 power monitor
+# U-Boot is the last CA55 user of RIIC0 (PMIC access in board_late_init()); Linux keeps
+# i2c0 disabled. The control block appears once uio_pdrv_genirq is loaded.
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/lpdemo-ctl --wait 10 grant
+ExecStop=/usr/bin/lpdemo-ctl revoke
+
+[Install]
+WantedBy=multi-user.target

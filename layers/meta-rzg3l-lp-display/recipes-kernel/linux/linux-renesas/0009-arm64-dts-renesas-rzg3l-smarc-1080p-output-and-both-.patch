@@ -1,0 +1,44 @@
+From f56a338e50c14f7eaa40f0faa9314e942c0be423 Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Fri, 16 Oct 2026 13:43:05 +0900
+Subject: [PATCH] arm64: dts: renesas: rzg3l-smarc: 1080p output and both LP
+ layers in UIO map 1 (LowPower Display demo)
+
+- The Step 4 GUI is laid out for 1920x1080: pin the HDMI connector to
+  CEA VIC 16, the mode U-Boot now programs (DISPLAY_MODE MIPI_DSI_1080P).
+- UIO map 1 covers the two LP layers of the SRAM, RPF0 0x5E000 (static
+  picture) and RPF1 0x7D000 (power read-out template), up to 0x9C000.
+---
+ .../boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi  | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi b/arch/arm64/boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi
+index f85af19..3cab2da 100644
+--- a/arch/arm64/boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi
++++ b/arch/arm64/boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi
+@@ -103,3 +103,22 @@
+ &ssi2 {
+ 	status = "disabled";
+ };
++
++/*
++ * Step 4: the demo GUI is laid out for 1920x1080. U-Boot (lpdemo u-boot bbappend) starts
++ * the boot logo with DISPLAY_MODE = MIPI_DSI_1080P; pin the HDMI connector to the same mode
++ * (CEA VIC 16: 1920x1080@60).
++ */
++&adv7535 {
++	renesas,seamless-boot-logo-vic = <16>;
++};
++
++/*
++ * Step 4: UIO map 1 covers both LP layers written by the GUI, RPF0 (0x5E000, static
++ * picture) and RPF1 (0x7D000, power read-out template), up to the TF-A area at 0x9C000.
++ */
++&lpdemo_ctrl {
++	reg = <0x0 0x5b000 0x0 0x1000>,
++	      <0x0 0x5e000 0x0 0x3e000>,
++	      <0x0 0x5a000 0x0 0x1000>;
++};
+-- 
+2.53.0
+

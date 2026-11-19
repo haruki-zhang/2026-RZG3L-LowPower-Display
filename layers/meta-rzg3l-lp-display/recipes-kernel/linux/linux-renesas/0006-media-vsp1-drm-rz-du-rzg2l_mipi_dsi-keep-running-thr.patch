@@ -1,0 +1,124 @@
+From a4568ba68e5e2ec3100f177eeb10d97df8d62b24 Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Wed, 14 Oct 2026 17:33:55 +0900
+Subject: [PATCH 6/8] media: vsp1, drm: rz-du: rzg2l_mipi_dsi: keep running
+ through the system suspend (LowPower Display demo)
+
+The system sleep callbacks of the VSP (pm_runtime_force_suspend/resume,
+vsp1_device_init() on resume) and of the MIPI DSI (unconditional assert
+of the DSI resets) stop a running display. With the new
+"renesas,lpdemo-keep-running" DT property they leave the hardware
+alone: the DU hands the running pipeline over to the CM33 for the
+system suspend (or the pipeline is already stopped).
+---
+ drivers/gpu/drm/renesas/rz-du/rzg2l_mipi_dsi.c | 16 ++++++++++++++++
+ drivers/media/platform/renesas/vsp1/vsp1.h     |  7 +++++++
+ drivers/media/platform/renesas/vsp1/vsp1_drv.c | 15 +++++++++++++++
+ 3 files changed, 38 insertions(+)
+
+diff --git a/drivers/gpu/drm/renesas/rz-du/rzg2l_mipi_dsi.c b/drivers/gpu/drm/renesas/rz-du/rzg2l_mipi_dsi.c
+index b023411ec1d5..6a8c3ac2645a 100644
+--- a/drivers/gpu/drm/renesas/rz-du/rzg2l_mipi_dsi.c
++++ b/drivers/gpu/drm/renesas/rz-du/rzg2l_mipi_dsi.c
+@@ -98,6 +98,13 @@ struct rzg2l_mipi_dsi {
+ 	 * first atomic enable or disable, whichever comes first.
+ 	 */
+ 	bool boot_logo_handover;
++
++	/*
++	 * Set from the "renesas,lpdemo-keep-running" DT property (RZ/G3L LowPower Display
++	 * demo): the link keeps streaming through the system suspend, the system sleep
++	 * callbacks must not assert the DSI resets.
++	 */
++	bool keep_running;
+ };
+ 
+ /*
+@@ -1110,6 +1117,9 @@ static int __maybe_unused rzg2l_mipi_pm_runtime_suspend_sleep(struct device *dev
+ {
+ 	struct rzg2l_mipi_dsi *dsi = dev_get_drvdata(dev);
+ 
++	if (dsi->keep_running)
++		return 0;
++
+ 	pm_runtime_put_sync(dsi->dev);
+ 	reset_control_assert(dsi->prstc);
+ 	reset_control_assert(dsi->arstc);
+@@ -1122,6 +1132,9 @@ static int __maybe_unused rzg2l_mipi_pm_runtime_resume_sleep(struct device *dev)
+ 	struct rzg2l_mipi_dsi *dsi = dev_get_drvdata(dev);
+ 	int ret;
+ 
++	if (dsi->keep_running)
++		return 0;
++
+ 	ret = reset_control_deassert(dsi->arstc);
+ 	if (ret < 0)
+ 		return ret;
+@@ -1251,6 +1264,9 @@ static int rzg2l_mipi_dsi_probe(struct platform_device *pdev)
+ 	dsi->boot_logo_handover =
+ 		of_property_read_bool(dsi->dev->of_node,
+ 				      "renesas,seamless-boot-logo");
++	dsi->keep_running =
++		of_property_read_bool(dsi->dev->of_node,
++				      "renesas,lpdemo-keep-running");
+ 
+ 	pm_runtime_enable(dsi->dev);
+ 
+diff --git a/drivers/media/platform/renesas/vsp1/vsp1.h b/drivers/media/platform/renesas/vsp1/vsp1.h
+index b0f9ab716d32..7df4cad199f0 100644
+--- a/drivers/media/platform/renesas/vsp1/vsp1.h
++++ b/drivers/media/platform/renesas/vsp1/vsp1.h
+@@ -115,6 +115,13 @@ struct vsp1_device {
+ 	 * by vsp1_finish_boot_logo_handover() once the kernel owns the device.
+ 	 */
+ 	bool boot_logo_handover;
++
++	/*
++	 * Set from the "renesas,lpdemo-keep-running" DT property (RZ/G3L LowPower
++	 * Display demo): the display pipeline keeps running through the system suspend,
++	 * driven by the CM33 from SRAM. The system sleep callbacks must leave the VSP alone.
++	 */
++	bool keep_running;
+ };
+ 
+ int vsp1_device_get(struct vsp1_device *vsp1);
+diff --git a/drivers/media/platform/renesas/vsp1/vsp1_drv.c b/drivers/media/platform/renesas/vsp1/vsp1_drv.c
+index 95dbbed80f4a..d94829bb1c1c 100644
+--- a/drivers/media/platform/renesas/vsp1/vsp1_drv.c
++++ b/drivers/media/platform/renesas/vsp1/vsp1_drv.c
+@@ -614,6 +614,14 @@ static int __maybe_unused vsp1_pm_suspend(struct device *dev)
+ {
+ 	struct vsp1_device *vsp1 = dev_get_drvdata(dev);
+ 
++	/*
++	 * The DU hands the running pipeline over to the CM33 (or it is already stopped):
++	 * no reset, and in particular no vsp1_device_init() on resume, which would tear the
++	 * self-looping display list chain down.
++	 */
++	if (vsp1->keep_running)
++		return 0;
++
+ 	/*
+ 	 * When used as part of a display pipeline, the VSP is stopped and
+ 	 * restarted explicitly by the DU.
+@@ -630,6 +638,9 @@ static int __maybe_unused vsp1_pm_resume(struct device *dev)
+ {
+ 	struct vsp1_device *vsp1 = dev_get_drvdata(dev);
+ 
++	if (vsp1->keep_running)
++		return 0;
++
+ 	pm_runtime_force_resume(vsp1->dev);
+ 
+ 	/*
+@@ -962,6 +973,10 @@ static int vsp1_probe(struct platform_device *pdev)
+ 	/* Configure device parameters based on the version register. */
+ 	pm_runtime_enable(&pdev->dev);
+ 
++	vsp1->keep_running =
++		of_property_read_bool(pdev->dev.of_node,
++				      "renesas,lpdemo-keep-running");
++
+ 	vsp1->boot_logo_handover =
+ 		of_property_read_bool(pdev->dev.of_node,
+ 				      "renesas,seamless-boot-logo");

@@ -1,0 +1,614 @@
+From 4d10feb0213c8f0f6ebb6c652986f3ac292837e4 Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Wed, 14 Oct 2026 17:30:21 +0900
+Subject: [PATCH] plat: g3l: add the DISP_RET suspend mode (LowPower Display
+ demo)
+
+PLAT_SYSTEM_SUSPEND=disp keeps PD_ISO powered during the system suspend:
+the display keeps running, driven by the CM33 firmware from on-chip SRAM,
+and the CM33 wakes the CA55 up when the user presses USER_SW3.
+
+BL2: hand the DDR retention CSRs over to the CM33 in SRAM (0x5A000, with
+CRC) instead of writing them to the boot media; never resume through BL2.
+
+BL31:
+- rz_pwr_domain_suspend(): do not touch RIIC0 (it belongs to the CM33);
+  check that the CM33 firmware runs; keep the GIC CPU interface enabled
+  and set MHU software interrupt ch4 (SPI 74, CM33 -> CA55 core 0) up as
+  the only wake-up source (Group 0, which is also enabled in GICD_CTLR:
+  gicv3_distif_init() leaves it off without secure interrupts; Group 1 is
+  masked at the CPU interface during the sleep; IRQ/FIQ are routed to EL3
+  for the WFI, as in rz_cpu_standby(), so that the interrupt ends it).
+- pwrc_disp_suspend(), from SRAM with the MMU off: optionally DDR
+  retention entry + PLL4 standby (susp_mode in the shared control block),
+  Cortex-A55 Sleep Mode (or plain WFI), WFI until the CM33 reports the
+  DDR restored, then continue at the BL31 warm entry point.
+- Progress is written to the control block, and optionally to the
+  console SCIF (susp_mode DEBUG_UART, works with the DDR in retention).
+---
+ plat/renesas/rz/common/g3l_common.mk          |   6 +
+ plat/renesas/rz/soc/g3l/drivers/pwrc/pwrc.c   | 189 ++++++++++++++++++
+ plat/renesas/rz/soc/g3l/drivers/sys.c         |   5 +-
+ plat/renesas/rz/soc/g3l/include/lpdemo_disp.h |  72 +++++++
+ plat/renesas/rz/soc/g3l/include/pwrc.h        |   8 +
+ plat/renesas/rz/soc/g3l/plat_ddr_setup.c      |  53 ++++-
+ plat/renesas/rz/soc/g3l/plat_pm.c             | 131 +++++++++++-
+ 7 files changed, 459 insertions(+), 5 deletions(-)
+ create mode 100644 plat/renesas/rz/soc/g3l/include/lpdemo_disp.h
+
+diff --git a/plat/renesas/rz/common/g3l_common.mk b/plat/renesas/rz/common/g3l_common.mk
+index 5ed286a7d..a658d3d52 100644
+--- a/plat/renesas/rz/common/g3l_common.mk
++++ b/plat/renesas/rz/common/g3l_common.mk
+@@ -33,6 +33,12 @@ ifneq ($(filter awo vbat,${PLAT_SYSTEM_SUSPEND}),)
+ override PLAT_SUSPEND_MODE		:= ${PLAT_SYSTEM_SUSPEND}
+ override PLAT_SYSTEM_SUSPEND	:= 1
+ PLAT_EMMC_WRITE_ENABLE			:= 1
++else ifeq (${PLAT_SYSTEM_SUSPEND},disp)
++# LowPower Display demo (DISP_RET): PD_ISO stays on, the CA55 sleeps in SRAM with the DDR
++# in retention and is woken up by the CM33. Nothing is written to the boot media: the DDR
++# retention CSRs are handed to the CM33 in SRAM.
++override PLAT_SUSPEND_MODE		:= disp
++override PLAT_SYSTEM_SUSPEND	:= 1
+ else
+ $(error Unknown suspend mode ${PLAT_SYSTEM_SUSPEND})
+ endif
+diff --git a/plat/renesas/rz/soc/g3l/drivers/pwrc/pwrc.c b/plat/renesas/rz/soc/g3l/drivers/pwrc/pwrc.c
+index bd394a4e3..638428115 100644
+--- a/plat/renesas/rz/soc/g3l/drivers/pwrc/pwrc.c
++++ b/plat/renesas/rz/soc/g3l/drivers/pwrc/pwrc.c
+@@ -82,6 +82,195 @@ void __dead2 pwrc_suspend_to_ram(void)
+ 	panic();
+ }
+ 
++#if PLAT_SYSTEM_SUSPEND_disp
++/*
++ * DISP_RET (RZ/G3L LowPower Display demo): PD_ISO stays powered. The display is driven by
++ * the CM33 from SRAM. The CA55 sleeps in WFI running from SRAM, optionally with the DDR in
++ * retention, until the CM33 has restored the DDR and given the display back to Linux; the
++ * CM33 then raises MHU software interrupt ch4 (GIC SPI 74, set up by rz_pwr_domain_suspend())
++ * and the CA55 continues at the BL31 warm entry point, as after a power-down.
++ *
++ * Everything below runs from SRAM (pwrc*.o is in the .sram section) with the MMU off: no
++ * DDR access, no console, until pwrc_go_disp_ret() jumps to the warm entry point.
++ */
++#include <cpg_regs.h>
++#include <lpdemo_disp.h>
++#include <rz_soc_def.h>
++
++#define GICD_ICENABLER_WAKE	(RZ_SOC_GICD_BASE + 0x180U + (LPDEMO_GIC_INTID_WAKE / 32U) * 4U)
++#define GICD_WAKE_BIT		(1U << (LPDEMO_GIC_INTID_WAKE % 32U))
++#define LPDEMO_SUSP_MODE_SKIP	(1U << 31)	/* internal: CM33 not alive, do not sleep */
++#define PLL4_STBY_STANDBY	(PLL4_STBY_RESETB_WEN)
++#define PLL4_WAIT_LOOPS		(1000000U)
++/* CPUPWRCTLR_EL1.CORE_PWRDN_EN (set by cortex_a55_core_pwr_dwn() in the PSCI power-down) */
++#define A55_CORE_PWRDN_EN	(1UL << 0)
++/* ICC_IGRPEN1_EL3: EnableGrp1NS | EnableGrp1S */
++#define ICC_IGRPEN1_EL3_G1_MASK	(3UL)
++
++/*
++ * No writable variables here: plat_copy_code_to_system_ram() maps this code read-only
++ * once copied to SRAM. The parameters are passed on the BL31 stack (DDR), read before the
++ * DDR goes into retention.
++ */
++struct disp_args {
++	uintptr_t warm_ep;
++	uint32_t mode;
++};
++
++/*
++ * Debug output straight to the console SCIF (LPDEMO_SUSP_MODE_DEBUG_UART): works from SRAM
++ * with the MMU off and the DDR in retention. Only used when Linux keeps the console running
++ * through the suspend (console_suspend=N), otherwise the SCIF clock may be off.
++ */
++static void disp_putc(char c)
++{
++	while (((mmio_read_16(LPDEMO_SCIF_FDR) >> 8) & 0x1FU) >= 16U)
++		;
++	mmio_write_8(LPDEMO_SCIF_FTDR, (uint8_t)c);
++}
++
++void pwrc_disp_puts(uint32_t mode, const char *s, uint32_t hex)
++{
++	if ((mode & LPDEMO_SUSP_MODE_DEBUG_UART) == 0U)
++		return;
++	disp_putc('\r');
++	disp_putc('\n');
++	disp_putc('[');
++	for (const char *p = "BL31 "; *p != '\0'; p++)
++		disp_putc(*p);
++	for (; *s != '\0'; s++)
++		disp_putc(*s);
++	disp_putc(' ');
++	for (int i = 28; i >= 0; i -= 4)
++		disp_putc("0123456789abcdef"[(hex >> i) & 0xFU]);
++	disp_putc(']');
++}
++
++static void disp_wr(uint32_t off, uint32_t val)
++{
++	mmio_write_32(LPDEMO_CTRL_BASE + off, val);
++}
++
++static void disp_stage(uint32_t mode, uint32_t stage)
++{
++	disp_wr(LPDEMO_OFF_BL31_STAGE, stage);
++	mmio_write_32(LPDEMO_TRACE_BASE + LPDEMO_TRACE_OFF_BL31_STAGE, stage);
++	dsbsy();
++	pwrc_disp_puts(mode, "stage", stage);
++}
++
++static void __dead2 pwrc_go_disp_ret(void *arg)
++{
++	const struct disp_args *args = arg;
++	uintptr_t warm_ep = args->warm_ep;
++	uint32_t mode = args->mode;
++	uint32_t state = LPDEMO_SUSP_SLEEP;
++	u_register_t pwrctlr;
++	u_register_t igrpen1;
++	u_register_t scr;
++
++	if ((mode & LPDEMO_SUSP_MODE_SKIP) != 0U)
++		goto warm_entry;
++
++	disp_stage(mode, LPDEMO_BL31_SRAM);
++
++	if ((mode & LPDEMO_SUSP_MODE_DDR_RET) != 0U) {
++		/* 12.1-12.12: DRAM self-refresh, PHY IO retention, controller in reset */
++		ddr_retention_entry();
++		disp_stage(mode, LPDEMO_BL31_DDR_RET);
++		mmio_write_32(CPG_PLL4_STBY, PLL4_STBY_STANDBY);
++		for (uint32_t i = 0; i < PLL4_WAIT_LOOPS; i++) {
++			if ((mmio_read_32(CPG_PLL4_MON) &
++			     (PLL4_MON_PLL4_RESETB | PLL4_MON_PLL4_LOCK)) == 0U)
++				break;
++		}
++		disp_stage(mode, LPDEMO_BL31_PLL4_OFF);
++		state = LPDEMO_SUSP_RETENTION;
++	}
++
++	/* The CM33 starts the wake-up handling from here (USER_SW3 / timer) */
++	disp_wr(LPDEMO_OFF_SUSP_STATE, state);
++	dsbsy();
++
++	/* WFI must be a standby, not a power-down request: the core keeps its power */
++	__asm__ volatile("mrs %0, S3_0_C15_C2_7" : "=r" (pwrctlr));
++	pwrctlr &= ~A55_CORE_PWRDN_EN;
++	__asm__ volatile("msr S3_0_C15_C2_7, %0" : : "r" (pwrctlr));
++	isb();
++
++	/*
++	 * Only the MHU interrupt (Group 0) may end the WFI: a pending Linux interrupt (Group 1)
++	 * would make the CA55 spin in the loop below. Linux re-enables Group 1 on resume.
++	 */
++	__asm__ volatile("mrs %0, S3_6_C12_C12_7" : "=r" (igrpen1));
++	__asm__ volatile("msr S3_6_C12_C12_7, %0" : : "r" (igrpen1 & ~ICC_IGRPEN1_EL3_G1_MASK));
++	isb();
++
++	/*
++	 * Route IRQ/FIQ to EL3 for the WFI, as rz_cpu_standby() does: an interrupt targeted at
++	 * a lower EL does not end a WFI executed in EL3. Group 0 is signalled as FIQ; it is
++	 * not taken (PSTATE masks it in EL3), it only wakes the core up.
++	 */
++	scr = read_scr_el3();
++	write_scr_el3(scr | SCR_IRQ_BIT | SCR_FIQ_BIT);
++	isb();
++
++	if ((mode & LPDEMO_SUSP_MODE_PLAIN_WFI) == 0U)
++		mmio_write_32(SYS_LP_CTL2, CA55_STBYCTL_SLEEP_START);
++
++	disp_stage(mode, LPDEMO_BL31_WFI);
++	for (;;) {
++		dsbsy();
++		wfi();
++		/* Wake-ups other than the CM33 (spurious, other interrupts) go back to sleep */
++		if (mmio_read_32(LPDEMO_CTRL_BASE + LPDEMO_OFF_SUSP_STATE) == LPDEMO_SUSP_RESUMED)
++			break;
++		pwrc_disp_puts(mode, "spurious wake-up, MHU",
++			       mmio_read_32(LPDEMO_MHU_SW_INT_STS4));
++	}
++
++	mmio_write_32(SYS_LP_CTL2, CA55_STBYCTL_RESUME_START);
++	write_scr_el3(scr);
++	__asm__ volatile("msr S3_6_C12_C12_7, %0" : : "r" (igrpen1));
++	isb();
++	disp_stage(mode, LPDEMO_BL31_WOKEN);
++
++	/* Negate the MHU interrupt and turn it off; plat_gic_resume() restores the GIC */
++	mmio_write_32(LPDEMO_MHU_SW_INT_CLR4, 1U);
++	mmio_write_32(GICD_ICENABLER_WAKE, GICD_WAKE_BIT);
++	dsbsy();
++	disp_wr(LPDEMO_OFF_SUSP_STATE, LPDEMO_SUSP_NONE);
++
++warm_entry:
++	disp_stage(mode, LPDEMO_BL31_WARM_ENTRY);
++	/* The DDR image of BL31 is intact: continue there as after a power-down */
++	__asm__ volatile("ic iallu\n"
++			 "tlbi alle3\n"
++			 "dsb sy\n"
++			 "isb\n"
++			 "br %0\n" : : "r" (warm_ep) : "memory");
++	__builtin_unreachable();
++}
++
++void __dead2 pwrc_disp_suspend(uintptr_t warm_ep, uint32_t mode, bool cm33_alive)
++{
++	/* On the BL31 stack: written back by the cache flush below, read with the MMU off */
++	struct disp_args args = {
++		.warm_ep = warm_ep,
++		.mode = cm33_alive ? mode : LPDEMO_SUSP_MODE_SKIP,
++	};
++
++	/* Forces the stores and writes them back (they are read with the MMU and caches off) */
++	flush_dcache_range((uintptr_t)&args, sizeof(args));
++	dcsw_op_all(DCCISW);
++	disable_mmu_el3();
++
++	pwrc_func_call_with_pmustack((uintptr_t)pwrc_go_disp_ret, &args);
++
++	panic();
++}
++#endif /* PLAT_SYSTEM_SUSPEND_disp */
++
+ void pwrc_setup(void)
+ {
+ 	const uint32_t rval[PLATFORM_CORE_COUNT][2] = {
+diff --git a/plat/renesas/rz/soc/g3l/drivers/sys.c b/plat/renesas/rz/soc/g3l/drivers/sys.c
+index 5821e1eee..91b6abc1a 100644
+--- a/plat/renesas/rz/soc/g3l/drivers/sys.c
++++ b/plat/renesas/rz/soc/g3l/drivers/sys.c
+@@ -79,7 +79,10 @@ bool sys_is_m33_core_booted(void)
+ 
+ bool sys_is_resume_reboot(void)
+ {
+-#if PLAT_SYSTEM_SUSPEND
++#if PLAT_SYSTEM_SUSPEND_disp
++	/* DISP_RET never resumes through BL2 (and RIIC0 belongs to the CM33) */
++	return false;
++#elif PLAT_SYSTEM_SUSPEND
+ 	return pwrc_board_is_resume();
+ #else
+ 	return false;
+diff --git a/plat/renesas/rz/soc/g3l/include/lpdemo_disp.h b/plat/renesas/rz/soc/g3l/include/lpdemo_disp.h
+new file mode 100644
+index 000000000..6a77aa16f
+--- /dev/null
++++ b/plat/renesas/rz/soc/g3l/include/lpdemo_disp.h
+@@ -0,0 +1,72 @@
++/*
++ * Copyright (c) 2026, Renesas Electronics Corporation. All rights reserved.
++ *
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++/*
++ * RZ/G3L LowPower Display demo (PLAT_SYSTEM_SUSPEND=disp): shared SRAM areas used with the
++ * CM33 firmware. Mirror of lpdemo_shared.h (meta-rzg3l-lp-display, lpdemo-cm33-fw),
++ * which checks these offsets with static asserts.
++ */
++#ifndef LPDEMO_DISP_H
++#define LPDEMO_DISP_H
++
++/* Control block (struct lpdemo_ctrl, version 4; BL31 uses the fields of v3) */
++#define LPDEMO_CTRL_BASE		U(0x0005B000)
++#define LPDEMO_CTRL_MAGIC		U(0x4344504C)	/* "LPDC" */
++#define LPDEMO_CTRL_VERSION		U(4)
++#define LPDEMO_OFF_MAGIC		U(0x00)
++#define LPDEMO_OFF_VERSION		U(0x04)
++#define LPDEMO_OFF_CM33_STATE		U(0x10)
++#define LPDEMO_OFF_HEARTBEAT		U(0x14)
++#define LPDEMO_OFF_SUSP_MODE		U(0xE0)
++#define LPDEMO_OFF_SUSP_STATE		U(0xE4)
++#define LPDEMO_OFF_SUSP_COUNT		U(0xE8)
++#define LPDEMO_OFF_BL31_STAGE		U(0xFC)
++
++#define LPDEMO_CM33_FAULT		U(0xEE)
++
++#define LPDEMO_SUSP_MODE_DDR_RET	(U(1) << 0)
++#define LPDEMO_SUSP_MODE_PLAIN_WFI	(U(1) << 1)
++#define LPDEMO_SUSP_MODE_DEBUG_UART	(U(1) << 3)	/* progress on the console (SCIF0) */
++
++#define LPDEMO_SUSP_NONE		U(0)
++#define LPDEMO_SUSP_SLEEP		U(1)
++#define LPDEMO_SUSP_RETENTION		U(2)
++#define LPDEMO_SUSP_RESUMED		U(4)
++
++#define LPDEMO_BL31_SUSPEND		U(0x3101)
++#define LPDEMO_BL31_NO_CM33		U(0x31A1)
++#define LPDEMO_BL31_SRAM		U(0x3102)
++#define LPDEMO_BL31_DDR_RET		U(0x3103)
++#define LPDEMO_BL31_PLL4_OFF		U(0x3104)
++#define LPDEMO_BL31_WFI			U(0x3105)
++#define LPDEMO_BL31_WOKEN		U(0x3106)
++#define LPDEMO_BL31_WARM_ENTRY		U(0x3107)
++#define LPDEMO_BL31_RESUMED		U(0x3108)
++
++/* DDR retention CSR snapshot for the CM33 (struct lpdemo_retcsr_hdr + data) */
++#define LPDEMO_RETCSR_BASE		U(0x0005A000)
++#define LPDEMO_RETCSR_MAGIC		U(0x52534352)	/* "RCSR" */
++#define LPDEMO_RETCSR_WORDS		U(384)		/* >= the 311 words TF-A uses */
++#define LPDEMO_RETCSR_HDR_SIZE		U(16)
++
++/* Trace kept across a reset (struct lpdemo_trace) */
++#define LPDEMO_TRACE_BASE		U(0x0005A800)
++#define LPDEMO_TRACE_OFF_BL31_STAGE	U(0x08)
++#define LPDEMO_TRACE_OFF_SUSP_COUNT	U(0x10)
++#define LPDEMO_TRACE_OFF_SUSP_MODE	U(0x18)
++
++/* Debug output: console SCIF0 (kept running by Linux with console_suspend=N only) */
++#define LPDEMO_SCIF_BASE		U(0x100AC000)
++#define LPDEMO_SCIF_FTDR		(LPDEMO_SCIF_BASE + U(0x06))
++#define LPDEMO_SCIF_FDR			(LPDEMO_SCIF_BASE + U(0x0E))
++
++/* Wake-up: MHU software interrupt ch4 (CM33 -> CA55 core 0) = GIC SPI 74 */
++#define LPDEMO_GIC_INTID_WAKE		U(106)		/* SPI 74 */
++#define LPDEMO_MHU_BASE			U(0x10400000)
++#define LPDEMO_MHU_SW_INT_STS4		(LPDEMO_MHU_BASE + U(0x840))
++#define LPDEMO_MHU_SW_INT_CLR4		(LPDEMO_MHU_BASE + U(0x848))
++
++#endif /* LPDEMO_DISP_H */
+diff --git a/plat/renesas/rz/soc/g3l/include/pwrc.h b/plat/renesas/rz/soc/g3l/include/pwrc.h
+index 2596de69a..3b2c5b2ba 100644
+--- a/plat/renesas/rz/soc/g3l/include/pwrc.h
++++ b/plat/renesas/rz/soc/g3l/include/pwrc.h
+@@ -7,7 +7,15 @@
+ #ifndef PWRC_H
+ #define PWRC_H
+ 
++#include <cdefs.h>
++#include <stdbool.h>
++#include <stdint.h>
++
+ void pwrc_suspend_to_ram(void);
++#if PLAT_SYSTEM_SUSPEND_disp
++void __dead2 pwrc_disp_suspend(uintptr_t warm_ep, uint32_t mode, bool cm33_alive);
++void pwrc_disp_puts(uint32_t mode, const char *s, uint32_t hex);
++#endif
+ void pwrc_setup(void);
+ void plat_secondary_reset(void);
+ 
+diff --git a/plat/renesas/rz/soc/g3l/plat_ddr_setup.c b/plat/renesas/rz/soc/g3l/plat_ddr_setup.c
+index c1c2fc4ea..33476c7fb 100644
+--- a/plat/renesas/rz/soc/g3l/plat_ddr_setup.c
++++ b/plat/renesas/rz/soc/g3l/plat_ddr_setup.c
+@@ -24,7 +24,56 @@
+ 
+ uint32_t ddr_csr_table[RET_CSR_SIZE] __aligned(8);
+ 
+-#if PLAT_SYSTEM_SUSPEND
++#if PLAT_SYSTEM_SUSPEND_disp
++#include <lib/cassert.h>
++#include <lib/mmio.h>
++#include <lpdemo_disp.h>
++
++CASSERT(LPDEMO_RETCSR_WORDS <= RET_CSR_SIZE, assert_lpdemo_retcsr_words);
++
++/* CRC-32 (IEEE 802.3, reflected, init/xorout 0xFFFFFFFF), as lp_crc32() of the CM33 */
++static uint32_t lpdemo_crc32(const uint32_t *p, uint32_t words)
++{
++	uint32_t crc = 0xFFFFFFFFU;
++
++	for (uint32_t i = 0; i < words; i++) {
++		uint32_t w = p[i];
++
++		for (uint32_t b = 0; b < 32; b++) {
++			uint32_t bit = (w ^ crc) & 1U;
++
++			crc >>= 1;
++			if (bit != 0U)
++				crc ^= 0xEDB88320U;
++			w >>= 1;
++		}
++	}
++	return ~crc;
++}
++
++/*
++ * DISP_RET: the CM33 runs the DDR retention exit, from the retention CSRs saved during the
++ * training. Hand them over in SRAM instead of writing them to the boot media.
++ */
++void plat_ddr_setup(void)
++{
++	uintptr_t data = LPDEMO_RETCSR_BASE + LPDEMO_RETCSR_HDR_SIZE;
++
++	ddr_setup();
++
++	for (uint32_t i = 0; i < LPDEMO_RETCSR_WORDS; i++)
++		mmio_write_32(data + i * 4U, ddr_csr_table[i]);
++	mmio_write_32(LPDEMO_RETCSR_BASE + 0x4U, LPDEMO_RETCSR_WORDS);
++	mmio_write_32(LPDEMO_RETCSR_BASE + 0x8U,
++		      lpdemo_crc32(ddr_csr_table, LPDEMO_RETCSR_WORDS));
++	mmio_write_32(LPDEMO_RETCSR_BASE + 0xCU, 0U);
++	/* BL2 maps the SRAM cacheable: make the snapshot visible to the CM33, magic last */
++	flush_dcache_range(LPDEMO_RETCSR_BASE, LPDEMO_RETCSR_HDR_SIZE + LPDEMO_RETCSR_WORDS * 4U);
++	mmio_write_32(LPDEMO_RETCSR_BASE, LPDEMO_RETCSR_MAGIC);
++	flush_dcache_range(LPDEMO_RETCSR_BASE, LPDEMO_RETCSR_HDR_SIZE);
++	INFO("DDR retention info handed over to the CM33 at 0x%x.\n", LPDEMO_RETCSR_BASE);
++}
++#elif PLAT_SYSTEM_SUSPEND
+ static image_info_t ddr_config_info = {
+ 	.h.type = (uint8_t)PARAM_IMAGE_BINARY,
+ 	.h.version = (uint8_t)VERSION_2,
+@@ -121,4 +170,4 @@ void plat_ddr_setup(void)
+ {
+ 	ddr_setup();
+ }
+-#endif /* PLAT_SYSTEM_SUSPEND */
++#endif /* PLAT_SYSTEM_SUSPEND_disp / PLAT_SYSTEM_SUSPEND */
+diff --git a/plat/renesas/rz/soc/g3l/plat_pm.c b/plat/renesas/rz/soc/g3l/plat_pm.c
+index 2854e3ac3..149a24c44 100644
+--- a/plat/renesas/rz/soc/g3l/plat_pm.c
++++ b/plat/renesas/rz/soc/g3l/plat_pm.c
+@@ -25,6 +25,11 @@
+ #include <rz_console.h>
+ #include <core_ctrl.h>
+ #include <lib/spinlock.h>
++#if PLAT_SYSTEM_SUSPEND_disp
++#include <drivers/arm/gicv3.h>
++#include <drivers/delay_timer.h>
++#include <lpdemo_disp.h>
++#endif
+ 
+ #define LO_REG							(0U)
+ #define HI_REG							(1U)
+@@ -78,15 +83,119 @@ static int rz_validate_ns_entrypoint(uintptr_t ns_entrypoint)
+ 	return PSCI_E_INVALID_ADDRESS;
+ }
+ 
++#if PLAT_SYSTEM_SUSPEND_disp
++/*
++ * RZ/G3L LowPower Display demo (DISP_RET): see pwrc_disp_suspend(). BL31 maps the SRAM
++ * cacheable, the CM33 does not use the CA55 caches: maintain the cache around accesses to
++ * the control block.
++ */
++static bool disp_cm33_alive;
++
++static uint32_t disp_rd(uint32_t off)
++{
++	inv_dcache_range(LPDEMO_CTRL_BASE + off, sizeof(uint32_t));
++	return mmio_read_32(LPDEMO_CTRL_BASE + off);
++}
++
++static void disp_wr(uint32_t off, uint32_t val)
++{
++	mmio_write_32(LPDEMO_CTRL_BASE + off, val);
++	flush_dcache_range(LPDEMO_CTRL_BASE + off, sizeof(uint32_t));
++}
++
++static void disp_stage(uint32_t stage)
++{
++	disp_wr(LPDEMO_OFF_BL31_STAGE, stage);
++	mmio_write_32(LPDEMO_TRACE_BASE + LPDEMO_TRACE_OFF_BL31_STAGE, stage);
++	flush_dcache_range(LPDEMO_TRACE_BASE + LPDEMO_TRACE_OFF_BL31_STAGE, sizeof(uint32_t));
++}
++
++/*
++ * Nobody but the CM33 can wake the CA55 up from DISP_RET: only sleep if its firmware runs
++ * (heartbeat advancing every 10 ms).
++ */
++static bool disp_check_cm33(void)
++{
++	uint32_t hb;
++
++	if (disp_rd(LPDEMO_OFF_MAGIC) != LPDEMO_CTRL_MAGIC ||
++	    disp_rd(LPDEMO_OFF_VERSION) != LPDEMO_CTRL_VERSION ||
++	    disp_rd(LPDEMO_OFF_CM33_STATE) == LPDEMO_CM33_FAULT)
++		return false;
++
++	hb = disp_rd(LPDEMO_OFF_HEARTBEAT);
++	for (int i = 0; i < 10; i++) {
++		mdelay(10);
++		if (disp_rd(LPDEMO_OFF_HEARTBEAT) != hb)
++			return true;
++	}
++	return false;
++}
++
++static void disp_suspend(void)
++{
++	unsigned int core = plat_my_core_pos();
++	uint32_t mode;
++
++	disp_cm33_alive = disp_check_cm33();
++	mode = disp_rd(LPDEMO_OFF_SUSP_MODE);
++	pwrc_disp_puts(mode, "suspend, CM33 alive", disp_cm33_alive ? 1U : 0U);
++	if (!disp_cm33_alive) {
++		disp_stage(LPDEMO_BL31_NO_CM33);
++		return;
++	}
++
++	disp_wr(LPDEMO_OFF_SUSP_COUNT, disp_rd(LPDEMO_OFF_SUSP_COUNT) + 1U);
++	mmio_write_32(LPDEMO_TRACE_BASE + LPDEMO_TRACE_OFF_SUSP_MODE, mode);
++	mmio_write_32(LPDEMO_TRACE_BASE + LPDEMO_TRACE_OFF_SUSP_COUNT,
++		      disp_rd(LPDEMO_OFF_SUSP_COUNT));
++	disp_stage(LPDEMO_BL31_SUSPEND);
++
++	/*
++	 * Wake-up source: MHU software interrupt ch4 (CM33 -> CA55 core 0), as a secure Group 0
++	 * interrupt routed to this core. The CPU interface is left enabled so that the pending
++	 * interrupt ends the WFI (it is not taken: interrupts are masked in EL3).
++	 * plat_gic_save() above recorded the configuration that plat_gic_resume() restores.
++	 */
++	gicv3_set_interrupt_group(LPDEMO_GIC_INTID_WAKE, core, INTR_GROUP0);
++	gicv3_set_interrupt_priority(LPDEMO_GIC_INTID_WAKE, core, GIC_HIGHEST_SEC_PRIORITY);
++	gicv3_set_spi_routing(LPDEMO_GIC_INTID_WAKE, GICV3_IRM_PE, read_mpidr_el1());
++	gicv3_enable_interrupt(LPDEMO_GIC_INTID_WAKE, core);
++
++	/*
++	 * gicv3_distif_init() only enables the groups that have secure interrupts configured,
++	 * none on this platform: Group 0 is off in the Distributor and would never be
++	 * forwarded. Enable it for the sleep; plat_gic_resume() restores GICD_CTLR.
++	 */
++	mmio_setbits_32(RZ_SOC_GICD_BASE + GICD_CTLR, CTLR_ENABLE_G0_BIT);
++	while ((mmio_read_32(RZ_SOC_GICD_BASE + GICD_CTLR) & GICD_CTLR_RWP_BIT) != 0U)
++		;
++	pwrc_disp_puts(mode, "wake-up source set, mode", mode);
++	pwrc_disp_puts(mode, "GICD_CTLR", mmio_read_32(RZ_SOC_GICD_BASE + GICD_CTLR));
++	/* INTID 106 = word 3, bit 10: group (0 = G0), group modifier, enable, pending, route */
++	pwrc_disp_puts(mode, "GICD_IGROUPR3", mmio_read_32(RZ_SOC_GICD_BASE + 0x080U + 12U));
++	pwrc_disp_puts(mode, "GICD_IGRPMODR3", mmio_read_32(RZ_SOC_GICD_BASE + 0xD00U + 12U));
++	pwrc_disp_puts(mode, "GICD_ISENABLER3", mmio_read_32(RZ_SOC_GICD_BASE + 0x100U + 12U));
++	pwrc_disp_puts(mode, "GICD_ISPENDR3", mmio_read_32(RZ_SOC_GICD_BASE + 0x200U + 12U));
++	pwrc_disp_puts(mode, "GICD_IROUTER106",
++		       mmio_read_32(RZ_SOC_GICD_BASE + 0x6000U + 8U * LPDEMO_GIC_INTID_WAKE));
++	pwrc_disp_puts(mode, "MPIDR", (uint32_t)read_mpidr_el1());
++}
++#endif /* PLAT_SYSTEM_SUSPEND_disp */
++
+ static void __dead2 rz_pwr_domain_pwr_down_wfi(const psci_power_state_t *target_state)
+ {
+-#if PLAT_SYSTEM_SUSPEND
++#if PLAT_SYSTEM_SUSPEND_disp
++	if (SYSTEM_PWR_STATE(target_state) == PLAT_MAX_OFF_STATE)
++		pwrc_disp_suspend(gp_warm_ep, disp_cm33_alive ? disp_rd(LPDEMO_OFF_SUSP_MODE) : 0U,
++				  disp_cm33_alive);
++#elif PLAT_SYSTEM_SUSPEND
+ 	if (SYSTEM_PWR_STATE(target_state) == PLAT_MAX_OFF_STATE) {
+ 		pwrc_suspend_to_ram();
+ 		/* The system is expected to power down and not return from the function above. */
+ 		panic();
+ 	}
+-#endif /* PLAT_SYSTEM_SUSPEND */
++#endif /* PLAT_SYSTEM_SUSPEND_disp / PLAT_SYSTEM_SUSPEND */
+ 	/*
+ 	 * Perform cache maintenance - hardware control not used.
+ 	 * Cache is flushed and disabled to ensure that no dirtly
+@@ -124,13 +233,25 @@ static void rz_pwr_domain_suspend(const psci_power_state_t *target_state)
+ 
+ 	unsigned long mpidr = read_mpidr_el1();
+ 
++#if !PLAT_SYSTEM_SUSPEND_disp
++	/* DISP_RET: RIIC0 belongs to the CM33 (power monitor), the PMIC is not used */
+ 	pfc_riic_pmic_setup();
++#endif
+ 
+ 	if (CORE_PWR_STATE(target_state) != PLAT_MAX_OFF_STATE)
+ 		return;
+ 
+ 	rz_program_trusted_mailbox(mpidr, gp_warm_ep);
+ 
++#if PLAT_SYSTEM_SUSPEND_disp
++	if (SYSTEM_PWR_STATE(target_state) == PLAT_MAX_OFF_STATE) {
++		/* Keep the CPU interface on: the MHU interrupt must end the WFI */
++		plat_gic_save();
++		disp_suspend();
++		return;
++	}
++#endif
++
+ 	/* Prevent interrupts from spuriously waking up this cpu */
+ 	plat_gic_cpuif_disable();
+ 	plat_gic_save();
+@@ -147,6 +268,12 @@ static void rz_pwr_domain_suspend_finish(const psci_power_state_t *target_state)
+ 
+ 	plat_copy_code_to_system_ram();
+ 	pwrc_setup();
++#if PLAT_SYSTEM_SUSPEND_disp
++	if (disp_cm33_alive) {
++		disp_stage(LPDEMO_BL31_RESUMED);
++		pwrc_disp_puts(disp_rd(LPDEMO_OFF_SUSP_MODE), "resumed, back to Linux", 0U);
++	}
++#endif
+ }
+ 
+ static void rz_get_sys_suspend_power_state(psci_power_state_t *req_state)

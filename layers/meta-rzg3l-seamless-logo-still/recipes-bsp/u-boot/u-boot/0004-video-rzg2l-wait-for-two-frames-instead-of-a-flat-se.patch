@@ -1,0 +1,85 @@
+From 25122165b06842028c49527305f54919cc3f0680 Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Mon, 24 Aug 2026 09:35:00 +0900
+Subject: [PATCH] video: rzg2l: wait for two frames instead of a flat second
+
+wait(1) took 1.02 s of the 2.15 s U-Boot needs, and it does not help the
+HDMI sink lock. Wait for two display starts instead (33 ms at 60 Hz),
+with a 100 ms timeout.
+
+Upstream-Status: Inappropriate [RZ/G3L boot logo, board specific]
+---
+ drivers/video/rzg2l/rzg2l_video.c | 46 +++++++++++++++++++++----------
+ 1 file changed, 31 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/video/rzg2l/rzg2l_video.c b/drivers/video/rzg2l/rzg2l_video.c
+index 5c161adf2f..3bbf60f972 100644
+--- a/drivers/video/rzg2l/rzg2l_video.c
++++ b/drivers/video/rzg2l/rzg2l_video.c
+@@ -58,7 +58,7 @@ static void rzg2l_du_init(void);
+ static void rzg2l_vcpd_init(void);
+ static void rzg2l_vcpd_dl_init(void);
+ static void rzg2l_lcdc_start(void);
+-static void wait(int bootdelay);
++static void rzg2l_wait_frames(unsigned int frames, unsigned int timeout_ms);
+ 
+ static void rzg2ul_adv7513_init(void);
+ static int adv7513_i2c_reg_write(struct udevice *dev, uint addr, uint mask, uint data);
+@@ -138,10 +138,11 @@ int rzg2l_video_init(void){
+ 
+ 	rzg2l_lcdc_start();
+ 
+-	/* Added this delay to display the first FB image.
+-	 * This may be removed when an HDMI monitor display is not used.
++	/*
++	 * rzg2l_lcdc_start() only waits for the pipeline to start. Wait for
++	 * two full frames, so that the image is really on screen.
+ 	 */
+-	wait(1);
++	rzg2l_wait_frames(2, 100);
+ 
+ 	return 0;
+ }
+@@ -955,16 +956,31 @@ static void rzg2l_lcdc_start(void)
+ #endif
+ }
+ 
+-static void wait(int delay)
++/*
++ * VI6_DISP0_IRQ_STA.DST is set once per output frame and cleared by writing 0.
++ * It is set even with the interrupt disabled in VI6_DISP0_IRQ_ENB, so it can
++ * be polled.
++ */
++#define VI6_DISP_IRQ_STA_DST	((uint32_t)0x00000100)
++
++/*
++ * Wait for @frames output frames. @timeout_ms keeps a display that never
++ * starts from hanging the boot.
++ */
++static void rzg2l_wait_frames(unsigned int frames, unsigned int timeout_ms)
+ {
+-	unsigned long ts;
+-
+-        while (delay > 0) {
+-                --delay;
+-                /* delay 1000 ms */
+-                ts = get_timer(0);
+-                do {
+-                        udelay(10000);
+-                } while (get_timer(ts) < 1000);
+-        }
++	unsigned long ts = get_timer(0);
++
++	while (frames--) {
++		reg_write(VSPD_VI6_DISP0_IRQ_STA, 0);
++
++		while (!(reg_read(VSPD_VI6_DISP0_IRQ_STA) &
++			 VI6_DISP_IRQ_STA_DST)) {
++			if (get_timer(ts) >= timeout_ms) {
++				printf("fast-logo: display start timed out\n");
++				return;
++			}
++			udelay(100);
++		}
++	}
+ }

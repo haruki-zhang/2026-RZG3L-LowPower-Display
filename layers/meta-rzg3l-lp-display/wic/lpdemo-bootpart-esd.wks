@@ -1,0 +1,11 @@
+# Short-description: SD card image for eSD boot with the LowPower Display Demo CM33 firmware
+# Long-description: rz-image-bootpart-esd.wks (meta-rz-bsp) plus the CM33 firmware (BL22)
+#                   at the offset BL2 reads it from: RZG3L_SD_M33_FW_BASE = 0x270000
+#                   (sector 4992). BL2 loads 192 KiB from there to SRAM 0x20000.
+
+part --source rawcopy --sourceparams="file=bl2_bp_esd-${MACHINE}.bin" --no-table
+part --source rawcopy --sourceparams="file=fip-${MACHINE}.bin" --no-table ${FIP_WIC_OFFSET} --align 64
+part --source rawcopy --sourceparams="file=lpdemo-cm33-fw-${MACHINE}.bin" --no-table --offset 4992s
+
+part --source bootimg-partition --fstype=vfat --label bootloader --align 1024
+part --source rootfs            --fstype=ext4 --label root       --align 4

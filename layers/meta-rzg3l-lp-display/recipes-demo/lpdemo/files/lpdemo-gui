@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+"""
+lpdemo-gui - RZ/G3L LowPower Display Demo GUI (GTK3, Wayland, 1920x1080).
+
+Normal screen (design_handoff_lpdemo_gui section 6, drawn by lpdemo_normal.py): the module
+power measured by the CM33 (5V_MODULE, ISL28022), its last 10 minutes and "Enter Low Power".
+The button puts the system into DISP_RET (lpdemo-ctl suspend): the CM33 shows the LP
+picture from SRAM, with the live power and the saving against the last 10 s of the normal
+mode, until USER_SW3 is pressed. The power samples the CM33 took meanwhile are added to the
+history afterwards.
+
+The LP periods are taken from the control block (enter_count / disp_state), not from the
+button: an LP period started on the command line (lpdemo-ctl suspend, lp run, lp enter,
+lp cycle) gets its band and the CM33 samples in the chart as well.
+
+LPDEMO_SUSPEND_MODE (lpdemo-gui.service) selects the mode:
+  retention  3b: full DISP_RET, DDR in self-refresh (default)
+  sleep      3a: system suspend, DDR active
+  none       Step 2: display hand-over only, no system suspend (lpdemo-ctl lp run)
+
+No error is shown on the screen (section 8): messages go to stdout / the journal.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import GLib, Gtk, Gdk  # noqa: E402
+
+import lpdemo_shm as shm  # noqa: E402
+import lpdemo_normal as N  # noqa: E402
+
+REFRESH_MS = 250                # current power
+SAMPLE_MS = int(N.SAMPLE_S * 1000)
+DATA_DIR = os.environ.get("LPDEMO_DATA_DIR", "/usr/share/lpdemo")
+
+CSS = b"""
+window { background-color: #F2F2F2; }
+button#lp { background-image: none; background-color: #2A289D; border: none;
+            border-radius: 2px; box-shadow: none; text-shadow: none; padding: 0;
+            outline: none; }
+button#lp:hover { background-color: #2A289D; }
+button#lp:active { background-color: #201E7E; }
+button#lp:disabled { background-color: #9897CC; }
+button#lp label { color: #FFFFFF; font-family: "DejaVu Sans"; font-weight: bold;
+                  font-size: 52px; }
+"""
+
+
+def boottime():
+    """CLOCK_BOOTTIME keeps counting through the suspend, CLOCK_MONOTONIC does not."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def log(msg):
+    print("lpdemo-gui: %s" % msg, flush=True)
+
+
+class DemoWindow(Gtk.Window):
+    def __init__(self, fullscreen):
+        super().__init__(title="RZ/G3L LowPower Display Demo")
+        self.set_default_size(N.SCREEN_W, N.SCREEN_H)
+        self.connect("destroy", Gtk.main_quit)
+        self.ctrl = None
+        self.ctrl_error = None
+        self.mw = None              # value shown
+        self.history = N.History()
+        self.lp_proc = None
+        self.lp_enter = None        # enter_count of the last LP period seen
+        self.lp_pressed = None      # CLOCK_BOOTTIME of the button press (before the ENTER)
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        fixed = Gtk.Fixed()
+        self.add(fixed)
+
+        logo = Gtk.Image.new_from_file(os.path.join(DATA_DIR, N.LOGO_FILE))
+        fixed.put(logo, N.LOGO_X, N.LOGO_Y)
+
+        x, y, w, h = N.POWER_AREA
+        self.power_area = Gtk.DrawingArea()
+        self.power_area.set_size_request(w, h)
+        self.power_area.connect("draw", self.on_draw_power)
+        fixed.put(self.power_area, x, y)
+
+        x, y, w, h = N.BUTTON
+        self.button = Gtk.Button(label=N.BUTTON_LABEL, name="lp")
+        self.button.set_size_request(w, h)
+        self.button.set_can_focus(False)
+        self.button.connect("clicked", self.on_low_power)
+        fixed.put(self.button, x, y)
+
+        x, y, w, h = N.CHART
+        self.chart = Gtk.DrawingArea()
+        self.chart.set_size_request(w, h)
+        self.chart.connect("draw", self.on_draw_chart)
+        fixed.put(self.chart, x, y)
+
+        if fullscreen:
+            self.fullscreen()
+        GLib.timeout_add(REFRESH_MS, self.refresh)
+        GLib.timeout_add(SAMPLE_MS, self.sample)
+        self.refresh()
+
+    # Drawing: lpdemo_normal works in screen coordinates
+    def on_draw_power(self, _widget, cr):
+        cr.translate(-N.POWER_AREA[0], -N.POWER_AREA[1])
+        N.draw_power(cr, self.mw)
+        return False
+
+    def on_draw_chart(self, _widget, cr):
+        cr.translate(-N.CHART[0], -N.CHART[1])
+        N.draw_chart(cr, boottime(), self.history.points, self.history.bands)
+        return False
+
+    # Control block
+    def snapshot(self):
+        try:
+            if self.ctrl is None:
+                self.ctrl = shm.Ctrl()
+            d = self.ctrl.snapshot()
+        except (shm.LpdemoError, OSError) as e:
+            self.ctrl = None
+            if str(e) != self.ctrl_error:
+                self.ctrl_error = str(e)
+                log(e)
+            return None
+        if not d["valid"]:
+            msg = "CM33 firmware not running (magic 0x%08x version %d)" % (d["magic"],
+                                                                          d["version"])
+            if msg != self.ctrl_error:
+                self.ctrl_error = msg
+                log(msg)
+            return None
+        self.ctrl_error = None
+        return d
+
+    @staticmethod
+    def power_of(d):
+        if d is None or d["pm_status"] != 0 or not d["pm_count"]:
+            return None
+        mw = d["power_avg_mw"]
+        return mw if 0 <= mw <= 9999 else None
+
+    def poll(self):
+        """Snapshot of the control block (None = invalid) with the LP periods tracked."""
+        d = self.snapshot()
+        if d is not None:
+            self.track_lp(d)
+        return d
+
+    def refresh(self):
+        d = self.poll()
+        if self.history.lp_active:
+            return True
+        mw = self.power_of(d)
+        if mw != self.mw:
+            self.mw = mw
+            self.power_area.queue_draw()
+        return True
+
+    def sample(self):
+        d = self.poll()
+        if not self.history.lp_active:  # LP period: the CM33 samples (ring buffer)
+            now = boottime()
+            self.history.add(now, self.power_of(d))
+            self.history.prune(now)
+            self.chart.queue_draw()
+        return True
+
+    # LP periods, from the control block: the button, or lpdemo-ctl on the command line
+    @staticmethod
+    def syc_offset(d):
+        """CLOCK_BOOTTIME - SYC seconds (SYC = CA55 CNTVCT; pm_syc is at most one period old)."""
+        return boottime() - d["pm_syc"] / float(shm.SYC_HZ)
+
+    def ring_start(self, d):
+        """Start of the LP period: the first CM33 sample (taken at the ENTER)."""
+        if not d["ring_count"]:     # first sample not taken yet: ring_syc0 is the old one
+            return boottime()
+        return (d["ring_syc0_hi"] << 32 | d["ring_syc0_lo"]) / float(shm.SYC_HZ) + \
+            self.syc_offset(d)
+
+    def track_lp(self, d):
+        enter, state = d["enter_count"], d["disp_state"]
+        if self.lp_enter is None:   # first valid snapshot
+            self.lp_enter = enter
+            if state == shm.DISP_LP:
+                log("started during a low power period")
+                self.history.lp_begin(self.ring_start(d))
+                self.button.set_sensitive(False)
+            return
+        if enter != self.lp_enter:
+            missed = ((enter - self.lp_enter) & 0xFFFFFFFF) - 1
+            self.lp_enter = enter
+            start = self.ring_start(d)
+            if self.history.lp_active:
+                # The end of the previous one was not seen: its samples are overwritten
+                self.history.lp_end(start)
+            if missed:
+                log("%d low power period(s) not seen (no samples)" % missed)
+            from_button = self.lp_pressed is not None
+            if from_button and self.lp_pressed <= start:
+                start = self.lp_pressed
+            self.lp_pressed = None
+            if state == shm.DISP_LINUX and not d["ring_count"]:
+                return              # no sample at all: nothing to show
+            self.history.lp_begin(start)
+            self.button.set_sensitive(False)
+            if not from_button:
+                log("low power period started outside the GUI (enter #%d)" % enter)
+        if self.history.lp_active and state == shm.DISP_LINUX:
+            self.lp_finish(d)
+
+    def lp_finish(self, d):
+        """The CM33 gave the display back: band and CM33 samples into the history."""
+        samples = self.lp_samples(d)
+        now = boottime()
+        end = now
+        if samples:                 # the CM33 samples only while it owns the display
+            end = min(now, samples[-1][0] + d["ring_period_ms"] / 1000.0)
+        self.history.lp_end(end, samples)
+        self.history.prune(now)
+        log("low power period: %.0f s, %d samples" %
+            (end - self.history.bands[-1][0] if self.history.bands else 0, len(samples)))
+        self.button.set_sensitive(self.lp_proc is None)
+        self.chart.queue_draw()
+
+    # Low power
+    def on_low_power(self, _button):
+        if self.lp_proc is not None:
+            return
+        now = boottime()
+        baseline = self.history.baseline_mw(now)
+        if baseline is None:
+            baseline = self.mw
+        mode = os.environ.get("LPDEMO_SUSPEND_MODE", "retention")
+        if mode == "none":
+            cmd = ["lpdemo-ctl", "lp", "run"]
+        else:
+            cmd = ["lpdemo-ctl", "suspend", "--mode", mode]
+        if baseline is not None:
+            cmd += ["--baseline-mw", str(baseline)]
+        log("entering low power: %s" % " ".join(cmd))
+        self.button.set_sensitive(False)
+        self.lp_pressed = now
+        try:
+            self.lp_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT, text=True)
+        except OSError as e:
+            log("cannot run lpdemo-ctl: %s" % e)
+            self.lp_pressed = None
+            self.button.set_sensitive(True)
+            return
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, self.lp_proc.pid, self.on_low_power_done)
+
+    def lp_samples(self, d):
+        """The CM33 LP samples as [(CLOCK_BOOTTIME, mW or None)]."""
+        try:
+            syc0, period, values = self.ctrl.lp_samples()
+        except (AttributeError, shm.LpdemoError, OSError) as e:
+            log("no LP samples: %s" % e)
+            return []
+        t0 = syc0 / float(shm.SYC_HZ) + self.syc_offset(d)
+        return [(t0 + k * period / 1000.0, v) for k, v in enumerate(values)]
+
+    def on_low_power_done(self, _pid, status):
+        out = self.lp_proc.stdout.read().strip() if self.lp_proc.stdout else ""
+        self.lp_proc.wait()
+        self.lp_proc = None
+        now = boottime()
+        for line in out.splitlines():
+            log("lpdemo-ctl: %s" % line)
+        if status != 0:
+            log("low power failed (exit status %d)" % status)
+        self.refresh()              # tracks the LP period (band, CM33 samples)
+        if self.lp_pressed is not None:     # no ENTER seen: the hand-over was refused
+            self.lp_pressed = None
+        self.history.prune(now)
+        self.button.set_sensitive(not self.history.lp_active)
+        self.chart.queue_draw()
+
+
+def main():
+    p = argparse.ArgumentParser(description="RZ/G3L LowPower Display Demo GUI")
+    p.add_argument("--windowed", action="store_true", help="do not go fullscreen")
+    args = p.parse_args()
+    win = DemoWindow(fullscreen=not args.windowed)
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

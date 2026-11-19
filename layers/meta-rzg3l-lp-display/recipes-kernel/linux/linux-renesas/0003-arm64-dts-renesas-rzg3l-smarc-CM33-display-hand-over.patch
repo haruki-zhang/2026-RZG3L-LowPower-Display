@@ -1,0 +1,61 @@
+From b192bac51f795052b1bb727285d683c268f53519 Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Wed, 14 Oct 2026 15:26:46 +0900
+Subject: [PATCH 3/4] arm64: dts: renesas: rzg3l-smarc: CM33 display hand-over
+ (LowPower Display demo)
+
+- Link the DU to the CM33 control block (renesas,lpdemo-ctrl) for the
+  display hand-over of the rz-du driver.
+- Map the LP picture area of the SRAM (0x5E000, 216 KiB) as UIO map 1.
+- Configure USER_SW3 (P65) as a GPIO input with pull-up. The CM33
+  firmware polls it to give the display back to Linux.
+---
+ .../boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi  | 33 +++++++++++++++++--
+ 1 file changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi b/arch/arm64/boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi
+index 10422732fd3f..a74138fbec00 100644
+--- a/arch/arm64/boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi
++++ b/arch/arm64/boot/dts/renesas/rzg3l-smarc-lpdemo.dtsi
+@@ -14,10 +14,39 @@ / {
+ 	 * Without linux,uio-name the UIO device would be named after the node
+ 	 * including the unit address ("lpdemo-ctrl@5b000").
+ 	 */
+-	lpdemo-ctrl@5b000 {
++	lpdemo_ctrl: lpdemo-ctrl@5b000 {
+ 		compatible = "renesas,rzg3l-lpdemo-ctrl";
+-		reg = <0x0 0x5b000 0x0 0x1000>;
++		/* UIO map 0: control block, map 1: LP picture (RPF0, written by the GUI) */
++		reg = <0x0 0x5b000 0x0 0x1000>,
++		      <0x0 0x5e000 0x0 0x36000>;
+ 		linux,uio-name = "lpdemo-ctrl";
++		/* USER_SW3, read by the CM33 (see &pinctrl below) */
++		pinctrl-0 = <&lpdemo_sw3_pins>;
++		pinctrl-names = "default";
++	};
++};
++
++/* The rz-du driver hands the running display over to the CM33 through the control block */
++&du {
++	renesas,lpdemo-ctrl = <&lpdemo_ctrl>;
++};
++
++/*
++ * USER_SW3 (SMARC GPIO7 -> IC31 -> P65, active low, no external pull-up) wakes the
++ * display from the CM33 side: the CM33 polls the pin. Linux owns the pin controller and
++ * configures the pin as a GPIO input with pull-up; nothing in Linux uses it.
++ */
++&pinctrl {
++	lpdemo-user-sw3-hog {
++		gpio-hog;
++		gpios = <RZG3L_GPIO(6, 5) GPIO_ACTIVE_LOW>;
++		input;
++		line-name = "lpdemo-user-sw3";
++	};
++
++	lpdemo_sw3_pins: lpdemo-user-sw3 {
++		pins = "P65";
++		bias-pull-up;
+ 	};
+ };
+ 

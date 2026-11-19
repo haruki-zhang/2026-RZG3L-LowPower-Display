@@ -1,0 +1,61 @@
+From 28b6c7b9ef412532228c3d6bfe84ea9740bdb0b1 Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Mon, 24 Aug 2026 09:30:00 +0900
+Subject: [PATCH] video: rzg2l: load the boot logo from the rootfs partition
+
+Partition 1 is the vfat boot partition, so "ext4load mmc 0:1" always
+failed and the display started on stale DRAM. Load the logo from /boot
+on partition 2. If loading fails, show a black frame: the kernel will not
+start the display itself.
+
+Upstream-Status: Inappropriate [RZ/G3L boot logo, board specific]
+---
+ drivers/video/rzg2l/rzg2l_video.c | 25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/video/rzg2l/rzg2l_video.c b/drivers/video/rzg2l/rzg2l_video.c
+index ecbf6ec314..5c161adf2f 100644
+--- a/drivers/video/rzg2l/rzg2l_video.c
++++ b/drivers/video/rzg2l/rzg2l_video.c
+@@ -65,6 +65,7 @@ static int adv7513_i2c_reg_write(struct udevice *dev, uint addr, uint mask, uint
+ static int adv7513_i2c_reg_read(struct udevice *dev, uint8_t addr, uint8_t *data);
+ 
+ int rzg2l_video_init(void){
++	int ret;
+ 
+ 	// adv7535_deinit();
+ 	rzg2l_cpg_init();
+@@ -98,13 +99,29 @@ int rzg2l_video_init(void){
+ 	adv7535_init();
+ #endif
+ 
+-	/* Load image data for splash screen */
++	/*
++	 * From /boot on partition 2, next to Image and the device tree.
++	 * Partition 1 is vfat, which ext4load cannot read.
++	 */
+ #if (DISPLAY_MODE == MIPI_DSI_1080P)
+-	run_command("ext4load mmc 0:1 0x48000000 boot_img_1080p.bin.gz",0);
++	ret = run_command("ext4load mmc 0:2 0x48000000 boot/boot_img_1080p.bin.gz", 0);
+ #else
+-	run_command("ext4load mmc 0:1 0x48000000 boot_img_720p.bin.gz",0);
++	ret = run_command("ext4load mmc 0:2 0x48000000 boot/boot_img_720p.bin.gz", 0);
+ #endif
+-	run_command("unzip 0x48000000 0x58000000",0);
++	if (!ret)
++		ret = run_command("unzip 0x48000000 0x58000000", 0);
++
++	if (ret) {
++		/*
++		 * Start the pipeline anyway, on a black frame. The device tree
++		 * declares the hand-over, so the kernel does not start the
++		 * display itself. Uninitialised DRAM would show noise.
++		 */
++		printf("fast-logo: no splash image, showing a blank screen\n");
++		memset((void *)(unsigned long)LCD_SRCM_ADDR, 0,
++		       LCD_SRCM_ADDR_OFFS);
++	}
++
+ 	dcache_disable();
+ 
+ 	// rzg2l_fpvcg_init();

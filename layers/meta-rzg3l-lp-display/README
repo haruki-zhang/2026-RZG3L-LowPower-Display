@@ -1,0 +1,78 @@
+meta-rzg3l-lp-display
+=====================
+
+Display on in system suspend for the RZ/G3L SMARC EVK. The CA55 (Cortex-A55)
+sleeps and the DDR is in self-refresh, while the CM33 (Cortex-M33) keeps a low
+power picture on screen from on-chip SRAM, with the module power updated every
+second. USER_SW3 wakes the system; the Linux GUI is back on screen before
+Linux has resumed.
+
+Tested with Renesas RZ Linux BSP Plus for RZ/G3L (RZG3L-BSP-1.0.0), the
+Multi-OS package, MACHINE = "smarc-rzg3l", eSD boot.
+
+
+I. Changes
+==========
+
+  CM33      Bare-metal firmware (lpdemo-cm33-fw), started by BL2, runs from
+            SRAM only. Measures the module power (ISL28022 on RIIC0), hands
+            the running display over from Linux and back by switching the
+            VSPD display list, redraws the power reading, and on USER_SW3
+            takes the DDR out of self-refresh and wakes the CA55 (MHU).
+  TF-A      System suspend mode PLAT_SYSTEM_SUSPEND=disp instead of vbat:
+            BL31 puts the DDR into self-refresh and sleeps in SRAM. BL2
+            copies the DDR retention parameters to SRAM.
+  U-Boot    The boot logo and the display start at 1920x1080.
+  Kernel    rz-du hands the display over to the CM33 on suspend and takes it
+            back on resume, without a mode set. vsp1 and MIPI DSI keep
+            running. RIIC0 is left to the CM33 (its clock stays on, i2c0 and
+            audio are disabled). The shared SRAM is exposed through UIO.
+  Apps      lpdemo-gui (GTK3, 1920x1080): power, 10 min chart and the
+            "Enter Low Power" button. lpdemo-ctl: status, low power entry,
+            test cycles.
+  Image     lpdemo-image: core-image-weston plus the above. The eSD WIC
+            image contains bl2, fip and the CM33 firmware.
+
+
+II. Build
+=========
+
+Start from the BSP build environment of Renesas RZ Linux BSP Plus
+(https://renesas-rz.github.io/rz_linux_bsp_plus/, RZ/G3L), with the
+Graphics package and the Multi-OS package (How To Build, Step 3). Then add
+the layers:
+
+  $ bitbake-layers add-layer ../meta-rz-features/meta-rz-multi-os/meta-rzg3l
+  $ bitbake-layers add-layer ../meta-rzg3l-seamless-logo-still
+  $ bitbake-layers add-layer ../meta-rzg3l-lp-display
+
+Set in conf/local.conf:
+
+  USE_OPENAMP = "0"
+
+Build:
+
+  $ MACHINE=smarc-rzg3l bitbake lpdemo-image
+
+
+III. Notes
+==========
+
+  - Enables MACHINE_FEATURES RZ_CM33_FIRMWARE_LOAD of the Multi-OS package.
+  - Cannot be combined with meta-rzg3l-fast-boot (USB disabled) or
+    meta-rzg3l-seamless-logo-sequence.
+  - bl2, fip, the CM33 firmware and the rootfs must come from the same
+    build: they share the control block layout in SRAM
+    (include/lpdemo_shared.h and lpdemo_shm.py, kept in sync by hand).
+  - BL2 reads the CM33 firmware from boot media offset 0x270000 (eMMC boot
+    partition 1, sector 0x1380). wic/lpdemo-bootpart-esd.wks puts it there.
+  - The SLEEP button no longer wakes the system: wake-up is USER_SW3 only
+    (or the timer of lpdemo-ctl).
+  - With meta-rzg3l-seamless-logo-cm33-anim, its animation is linked into
+    this firmware (hooks in src/ext.h). SRAM 0x59C00-0x59FFF is reserved
+    for it.
+  - src/lp_glyphs.h (digits of the power reading) is generated offline by
+    tools/gen_lp_glyphs.py, not in the Yocto build. Regenerate it after a
+    change of the RPF1 layout in lpdemo_lpimage.py.
+  - If the system does not wake up: lpdemo-ctl suspend --debug prints the
+    BL31 and CM33 progress on the serial console.

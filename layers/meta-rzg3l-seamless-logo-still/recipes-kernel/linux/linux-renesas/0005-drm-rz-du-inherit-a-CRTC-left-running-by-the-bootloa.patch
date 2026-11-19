@@ -1,0 +1,117 @@
+From e459a97c3c457c0b20daf85a59ba1466cb9279e5 Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Wed, 5 Aug 2026 11:55:13 +0900
+Subject: [PATCH] drm: rz-du: inherit a CRTC left running by the bootloader
+
+The first modeset re-locks PLL7 and restarts DU sync, so HDMI loses
+sync only to program the values U-Boot already wrote. Skip the timing
+setup and the restart while the hand-over is pending.
+
+Upstream-Status: Inappropriate [RZ/G3L boot logo, board specific]
+---
+ drivers/gpu/drm/renesas/rz-du/rzg2l_du_crtc.c | 39 +++++++++++++++++++
+ drivers/gpu/drm/renesas/rz-du/rzg2l_du_crtc.h |  6 +++
+ 2 files changed, 45 insertions(+)
+
+diff --git a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_crtc.c b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_crtc.c
+index 456edf69c541..d856c0183ac3 100644
+--- a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_crtc.c
++++ b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_crtc.c
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/clk.h>
+ #include <linux/mutex.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/clk-provider.h>
+ #include <linux/reset.h>
+@@ -73,6 +74,15 @@ static void rzg2l_du_crtc_set_display_timing(struct rzg2l_du_crtc *rcrtc)
+ 
+ 	clk_prepare_enable(rcrtc->rzg2l_clocks.dclk);
+ 
++	/*
++	 * U-Boot already programmed these values. clk_set_rate() would re-lock
++	 * PLL7, and rewriting DU_DITR0..4 restarts DU sync: HDMI would lose
++	 * sync for several frames. clk_prepare_enable() above stays, because
++	 * rzg2l_du_crtc_put() disables the clock.
++	 */
++	if (rcrtc->boot_logo_handover)
++		return;
++
+ 	if (of_device_is_compatible(rcrtc->dev->dev->of_node, "renesas,r9a08g046-du")) {
+ 		struct clk *clk_parent;
+ 		struct clk_hw *hw_parent, *hw_pparent;
+@@ -298,6 +308,15 @@ static void rzg2l_du_crtc_atomic_enable(struct drm_crtc *crtc,
+ 
+ 	rzg2l_du_crtc_get(rcrtc);
+ 
++	/*
++	 * DU_MCR0.DI_EN is still set by U-Boot. Writing it again restarts the
++	 * display interface, and the sink re-syncs.
++	 */
++	if (rcrtc->boot_logo_handover) {
++		rcrtc->boot_logo_handover = false;
++		return;
++	}
++
+ 	rzg2l_du_crtc_start(rcrtc);
+ }
+ 
+@@ -306,6 +325,9 @@ static void rzg2l_du_crtc_atomic_disable(struct drm_crtc *crtc,
+ {
+ 	struct rzg2l_du_crtc *rcrtc = to_rzg2l_crtc(crtc);
+ 
++	/* Nothing to keep once the CRTC goes down. */
++	rcrtc->boot_logo_handover = false;
++
+ 	rzg2l_du_crtc_stop(rcrtc);
+ 	rzg2l_du_crtc_put(rcrtc);
+ 
+@@ -335,6 +357,19 @@ static void rzg2l_du_crtc_atomic_flush(struct drm_crtc *crtc,
+ 		spin_unlock_irqrestore(&dev->event_lock, flags);
+ 	}
+ 
++	/*
++	 * drm_atomic_helper_commit_tail_rpm() enables the CRTC before it
++	 * commits planes, and the enable clears the hand-over. So the first
++	 * commit is flushed and replaces the logo: nothing in the kernel may
++	 * commit before the compositor.
++	 *
++	 * The check is a guard. A flush during the hand-over would commit a
++	 * display list from an unconfigured pipeline into VI6_DL_HDR_ADDR0,
++	 * over the bootloader's chain.
++	 */
++	if (rcrtc->boot_logo_handover)
++		return;
++
+ 	rzg2l_du_vsp_atomic_flush(rcrtc);
+ }
+ 
+@@ -448,6 +483,10 @@ int rzg2l_du_crtc_create(struct rzg2l_du_device *rcdu)
+ 		return PTR_ERR(rcrtc->rzg2l_clocks.dclk);
+ 	}
+ 
++	rcrtc->boot_logo_handover =
++		of_property_read_bool(rcdu->dev->of_node,
++				      "renesas,seamless-boot-logo");
++
+ 	init_waitqueue_head(&rcrtc->flip_wait);
+ 	rcrtc->dev = rcdu;
+ 
+diff --git a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_crtc.h b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_crtc.h
+index cbba38acc377..d27b93f22703 100644
+--- a/drivers/gpu/drm/renesas/rz-du/rzg2l_du_crtc.h
++++ b/drivers/gpu/drm/renesas/rz-du/rzg2l_du_crtc.h
+@@ -44,6 +44,12 @@ struct rzg2l_du_crtc {
+ 	struct rzg2l_du_device *dev;
+ 	bool initialized;
+ 
++	/*
++	 * From "renesas,seamless-boot-logo": the bootloader's CRTC is still
++	 * running. Cleared by the first atomic enable or disable.
++	 */
++	bool boot_logo_handover;
++
+ 	bool vblank_enable;
+ 	struct drm_pending_vblank_event *event;
+ 	wait_queue_head_t flip_wait;

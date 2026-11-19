@@ -1,0 +1,233 @@
+From 34d6563ea81e53eddb520b1efa7c596a2911ee34 Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Wed, 5 Aug 2026 11:54:16 +0900
+Subject: [PATCH] media: vsp1: take over a pipeline left running by the
+ bootloader
+
+Probe and the first vsp1_du_setup_lif() reset the VSPD and drop the
+bootloader's display list chain. While the hand-over is pending, hold a
+runtime PM reference, skip the device init, and start the pipeline only
+on the first display list with planes, so no black frame is shown.
+
+Upstream-Status: Inappropriate [RZ/G3L boot logo, board specific]
+---
+ drivers/media/platform/renesas/vsp1/vsp1.h    |  7 +++
+ .../media/platform/renesas/vsp1/vsp1_drm.c    | 50 +++++++++++++++++++
+ .../media/platform/renesas/vsp1/vsp1_drm.h    |  7 +++
+ .../media/platform/renesas/vsp1/vsp1_drv.c    | 37 +++++++++++++-
+ 4 files changed, 100 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/renesas/vsp1/vsp1.h b/drivers/media/platform/renesas/vsp1/vsp1.h
+index 2f6f0c6ae555..b18b52e05827 100644
+--- a/drivers/media/platform/renesas/vsp1/vsp1.h
++++ b/drivers/media/platform/renesas/vsp1/vsp1.h
+@@ -107,10 +107,17 @@ struct vsp1_device {
+ 	struct media_entity_operations media_ops;
+ 
+ 	struct vsp1_drm *drm;
++
++	/*
++	 * From "renesas,seamless-boot-logo": the bootloader's pipeline is still
++	 * running. A runtime PM reference is held while it is set.
++	 */
++	bool boot_logo_handover;
+ };
+ 
+ int vsp1_device_get(struct vsp1_device *vsp1);
+ void vsp1_device_put(struct vsp1_device *vsp1);
++void vsp1_finish_boot_logo_handover(struct vsp1_device *vsp1);
+ 
+ int vsp1_reset_wpf(struct vsp1_device *vsp1, unsigned int index);
+ 
+diff --git a/drivers/media/platform/renesas/vsp1/vsp1_drm.c b/drivers/media/platform/renesas/vsp1/vsp1_drm.c
+index b5d1f238f7be..690a42aac76d 100644
+--- a/drivers/media/platform/renesas/vsp1/vsp1_drm.c
++++ b/drivers/media/platform/renesas/vsp1/vsp1_drm.c
+@@ -700,6 +700,7 @@ int vsp1_du_setup_lif(struct device *dev, unsigned int pipe_index,
+ 		}
+ 
+ 		drm_pipe->du_complete = NULL;
++		drm_pipe->boot_logo_start_pending = false;
+ 		pipe->num_inputs = 0;
+ 
+ 		dev_dbg(vsp1->dev, "%s: pipe %u: releasing %s\n",
+@@ -713,6 +714,12 @@ int vsp1_du_setup_lif(struct device *dev, unsigned int pipe_index,
+ 		mutex_unlock(&vsp1->drm->lock);
+ 
+ 		vsp1_dlm_reset(pipe->output->dlm);
++
++		/*
++		 * Disabled before the kernel took the pipeline over. Drop the
++		 * hand-over reference first, so that the put below suspends.
++		 */
++		vsp1_finish_boot_logo_handover(vsp1);
+ 		vsp1_device_put(vsp1);
+ 
+ 		dev_dbg(vsp1->dev, "%s: pipeline disabled\n", __func__);
+@@ -760,6 +767,21 @@ int vsp1_du_setup_lif(struct device *dev, unsigned int pipe_index,
+ 	vsp1_write(vsp1, VI6_DISP_IRQ_STA(pipe_index), 0);
+ 	vsp1_write(vsp1, VI6_DISP_IRQ_ENB(pipe_index), 0);
+ 
++	/*
++	 * The planes of this commit are not set up yet:
++	 * drm_atomic_helper_commit_tail_rpm() enables the CRTC first. A display
++	 * list now would have no inputs, and the BRx would show a black frame.
++	 * Keep the bootloader's list running. The first vsp1_du_atomic_flush()
++	 * starts the pipeline.
++	 */
++	if (vsp1->boot_logo_handover) {
++		drm_pipe->boot_logo_start_pending = true;
++		mutex_unlock(&vsp1->drm->lock);
++		dev_dbg(vsp1->dev, "%s: pipeline start deferred to the first flush\n",
++			__func__);
++		return 0;
++	}
++
+ 	/* Configure all entities in the pipeline. */
+ 	vsp1_du_pipeline_configure(pipe);
+ 
+@@ -774,6 +796,12 @@ int vsp1_du_setup_lif(struct device *dev, unsigned int pipe_index,
+ 	vsp1_pipeline_run(pipe);
+ 	spin_unlock_irqrestore(&pipe->irqlock, flags);
+ 
++	/*
++	 * The kernel's display list is committed and is latched at the next
++	 * frame boundary. Runtime PM can take the device back.
++	 */
++	vsp1_finish_boot_logo_handover(vsp1);
++
+ 	dev_dbg(vsp1->dev, "%s: pipeline enabled\n", __func__);
+ 
+ 	return 0;
+@@ -895,6 +923,7 @@ void vsp1_du_atomic_flush(struct device *dev, unsigned int pipe_index,
+ 	struct vsp1_device *vsp1 = dev_get_drvdata(dev);
+ 	struct vsp1_drm_pipeline *drm_pipe = &vsp1->drm->pipe[pipe_index];
+ 	struct vsp1_pipeline *pipe = &drm_pipe->pipe;
++	bool started = false;
+ 	int ret;
+ 
+ 	drm_pipe->crc = cfg->crc;
+@@ -922,8 +951,29 @@ void vsp1_du_atomic_flush(struct device *dev, unsigned int pipe_index,
+ 
+ 	vsp1_du_pipeline_configure(pipe);
+ 
++	/*
++	 * First flush after a deferred start: this list carries the planes. It
++	 * is latched at the next frame boundary, so the logo is replaced
++	 * without a frame in between.
++	 */
++	if (drm_pipe->boot_logo_start_pending) {
++		unsigned long flags;
++
++		drm_pipe->boot_logo_start_pending = false;
++
++		spin_lock_irqsave(&pipe->irqlock, flags);
++		vsp1_pipeline_run(pipe);
++		spin_unlock_irqrestore(&pipe->irqlock, flags);
++
++		started = true;
++	}
++
+ done:
+ 	mutex_unlock(&vsp1->drm->lock);
++
++	/* The kernel owns the VSP now; give it back to runtime PM. */
++	if (started)
++		vsp1_finish_boot_logo_handover(vsp1);
+ }
+ EXPORT_SYMBOL_GPL(vsp1_du_atomic_flush);
+ 
+diff --git a/drivers/media/platform/renesas/vsp1/vsp1_drm.h b/drivers/media/platform/renesas/vsp1/vsp1_drm.h
+index 3fd95b53f27e..85f108b68638 100644
+--- a/drivers/media/platform/renesas/vsp1/vsp1_drm.h
++++ b/drivers/media/platform/renesas/vsp1/vsp1_drm.h
+@@ -46,6 +46,13 @@ struct vsp1_drm_pipeline {
+ 	/* Frame synchronisation */
+ 	void (*du_complete)(void *data, unsigned int status, u32 crc);
+ 	void *du_private;
++
++	/*
++	 * Set by vsp1_du_setup_lif() during a boot logo hand-over: the pipeline
++	 * is set up but not started. The first vsp1_du_atomic_flush() starts
++	 * it.
++	 */
++	bool boot_logo_start_pending;
+ };
+ 
+ /**
+diff --git a/drivers/media/platform/renesas/vsp1/vsp1_drv.c b/drivers/media/platform/renesas/vsp1/vsp1_drv.c
+index c2f519776969..8e94f5931de7 100644
+--- a/drivers/media/platform/renesas/vsp1/vsp1_drv.c
++++ b/drivers/media/platform/renesas/vsp1/vsp1_drv.c
+@@ -590,6 +590,19 @@ void vsp1_device_put(struct vsp1_device *vsp1)
+ 	pm_runtime_put_sync(vsp1->dev);
+ }
+ 
++/*
++ * Release the reference vsp1_probe() took for the boot logo hand-over. Safe to
++ * call more than once.
++ */
++void vsp1_finish_boot_logo_handover(struct vsp1_device *vsp1)
++{
++	if (!vsp1->boot_logo_handover)
++		return;
++
++	vsp1->boot_logo_handover = false;
++	pm_runtime_put(vsp1->dev);
++}
++
+ /* -----------------------------------------------------------------------------
+  * Power Management
+  */
+@@ -645,7 +658,12 @@ static int __maybe_unused vsp1_pm_runtime_resume(struct device *dev)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	if (vsp1->info) {
++	/*
++	 * vsp1_device_init() resets WPF0 and the DPR routes, which tears down
++	 * the bootloader's display list chain. vsp1_probe() keeps the device
++	 * resumed during the hand-over, so this is only a safety net.
++	 */
++	if (vsp1->info && !vsp1->boot_logo_handover) {
+ 		/*
+ 		 * On R-Car Gen2 and RZ/G1, vsp1 register access after deassert
+ 		 * can cause lock-up. It is a special case and needs some delay
+@@ -938,6 +956,21 @@ static int vsp1_probe(struct platform_device *pdev)
+ 	/* Configure device parameters based on the version register. */
+ 	pm_runtime_enable(&pdev->dev);
+ 
++	vsp1->boot_logo_handover =
++		of_property_read_bool(pdev->dev.of_node,
++				      "renesas,seamless-boot-logo");
++	if (vsp1->boot_logo_handover) {
++		/*
++		 * Keep the device resumed. Otherwise the put below suspends it,
++		 * and the suspend asserts the shared LCDC reset under the logo.
++		 */
++		ret = pm_runtime_resume_and_get(&pdev->dev);
++		if (ret < 0) {
++			vsp1->boot_logo_handover = false;
++			goto done;
++		}
++	}
++
+ 	ret = vsp1_device_get(vsp1);
+ 	if (ret < 0)
+ 		goto done;
+@@ -978,6 +1011,7 @@ static int vsp1_probe(struct platform_device *pdev)
+ 
+ done:
+ 	if (ret) {
++		vsp1_finish_boot_logo_handover(vsp1);
+ 		pm_runtime_disable(&pdev->dev);
+ 		rcar_fcp_put(vsp1->fcp);
+ 	}
+@@ -992,6 +1026,7 @@ static void vsp1_remove(struct platform_device *pdev)
+ 	vsp1_destroy_entities(vsp1);
+ 	rcar_fcp_put(vsp1->fcp);
+ 
++	vsp1_finish_boot_logo_handover(vsp1);
+ 	pm_runtime_disable(&pdev->dev);
+ }
+ 

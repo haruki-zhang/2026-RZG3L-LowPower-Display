@@ -1,0 +1,63 @@
+From 2da571339a47d9514f81a61efc86631e0dd1ea3f Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Wed, 14 Oct 2026 17:34:31 +0900
+Subject: [PATCH 7/8] clk: renesas: rzg2l-cpg: only restore the clock settings
+ that were lost on resume
+
+On RZ/G3L the resume rewrites every PLL (and re-enables it) and every
+divider and mux register, even when the CPG kept its power through the
+suspend. With the DISP_RET suspend of the LowPower Display demo the LCDC
+keeps scanning out from PLL7 during the suspend, and reprogramming the
+running PLL7 and the DSI dividers could glitch the display. Skip the
+registers that still hold the saved settings (and the PLLs that are
+still locked).
+---
+ drivers/clk/renesas/rzg2l-cpg.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/drivers/clk/renesas/rzg2l-cpg.c b/drivers/clk/renesas/rzg2l-cpg.c
+index 6a0dae222680..1a439c424870 100644
+--- a/drivers/clk/renesas/rzg2l-cpg.c
++++ b/drivers/clk/renesas/rzg2l-cpg.c
+@@ -2480,10 +2480,21 @@ static int rzg2l_cpg_resume(struct device *dev)
+ 	if (!priv->cache)
+ 		return 0;
+ 
++	/*
++	 * Only rewrite what was lost. When the CPG kept its power through the suspend (e.g.
++	 * RZ/G3L DISP_RET, where the LCDC keeps scanning out from PLL7 during the suspend),
++	 * reprogramming a running PLL or divider could glitch the clocks of running hardware.
++	 */
+ 	for (i = 0; i < info->num_core_clks; i++) {
+ 		if ((info->core_clks[i].type == CLK_TYPE_G3L_PLL) ||
+ 		    (info->core_clks[i].type == CLK_TYPE_G3L_PLLDSI)) {
+ 			id = info->core_clks[i].id;
++			if (readl(priv->base + GET_REG_SAMPLL_CLK1(info->core_clks[i].conf)) ==
++			    priv->cache[i].pll_clk1 &&
++			    readl(priv->base + GET_REG_SAMPLL_CLK2(info->core_clks[i].conf)) ==
++			    priv->cache[i].pll_clk2 &&
++			    rzg3l_cpg_pll_clk_is_enabled(__clk_get_hw(priv->clks[id])))
++				continue;
+ 			writel(priv->cache[i].pll_clk1,
+ 						priv->base + GET_REG_SAMPLL_CLK1(info->core_clks[i].conf));
+ 			writel(priv->cache[i].pll_clk2,
+@@ -2494,6 +2505,9 @@ static int rzg2l_cpg_resume(struct device *dev)
+ 		}
+ 
+ 		if (info->core_clks[i].type == CLK_TYPE_MUX) {
++			if ((readl(priv->base + GET_REG_OFFSET(info->core_clks[i].conf)) & ~wen_mask) ==
++			    (priv->cache[i].mux & ~wen_mask))
++				continue;
+ 			writel(priv->cache[i].mux | wen_mask,
+ 							priv->base + GET_REG_OFFSET(info->core_clks[i].conf));
+ 			continue;
+@@ -2502,6 +2516,9 @@ static int rzg2l_cpg_resume(struct device *dev)
+ 		if ((info->core_clks[i].type == CLK_TYPE_DIV) ||
+ 		    (info->core_clks[i].type == CLK_TYPE_G3S_DIV) ||
+ 		    (info->core_clks[i].type == CLK_TYPE_G3L_PLLDSI_DIV)) {
++			if ((readl(priv->base + GET_REG_OFFSET(info->core_clks[i].conf)) & ~wen_mask) ==
++			    (priv->cache[i].div & ~wen_mask))
++				continue;
+ 			writel(priv->cache[i].div | wen_mask,
+ 							priv->base + GET_REG_OFFSET(info->core_clks[i].conf));
+ 			if (info->core_clks[i].sconf)

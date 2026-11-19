@@ -1,0 +1,30 @@
+From 58d79d64fcb4f789ae94a553a507122390a7784f Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Fri, 16 Oct 2026 13:43:42 +0900
+Subject: [PATCH] video: rzg2l: start the boot logo at 1080p (LowPower Display
+ demo)
+
+The LowPower Display demo GUI (Step 4) is laid out for 1920x1080. Select
+DISPLAY_MODE MIPI_DSI_1080P, which also loads boot/boot_img_1080p.bin.gz.
+The kernel pins the HDMI connector to the same mode (CEA VIC 16, DT
+renesas,seamless-boot-logo-vic in rzg3l-smarc-lpdemo.dtsi).
+---
+ drivers/video/rzg2l/rzg2l_video.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/video/rzg2l/rzg2l_video.c b/drivers/video/rzg2l/rzg2l_video.c
+index 63cbe84..988f0c9 100644
+--- a/drivers/video/rzg2l/rzg2l_video.c
++++ b/drivers/video/rzg2l/rzg2l_video.c
+@@ -32,7 +32,7 @@
+ #define	LVDS_720P		2
+ #define PARALLEL_RGB_720P	3
+ 
+-#define	DISPLAY_MODE MIPI_DSI_720P
++#define	DISPLAY_MODE MIPI_DSI_1080P
+ 
+ #if (DISPLAY_MODE == MIPI_DSI_1080P)
+ #include "define_1080p.h"
+-- 
+2.53.0
+

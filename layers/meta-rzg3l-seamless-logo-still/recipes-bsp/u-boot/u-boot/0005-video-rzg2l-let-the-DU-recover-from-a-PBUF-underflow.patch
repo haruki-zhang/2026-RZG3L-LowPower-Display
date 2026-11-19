@@ -1,0 +1,27 @@
+From 3504a2d48588f2e7abe7f3828f4d37588f556fcf Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Tue, 27 Oct 2026 09:00:00 +0900
+Subject: [PATCH] video: rzg2l: let the DU recover from a PBUF underflow
+
+Without DU_MCR1.PB_AUTOCLR, one PBUF underflow leaves the screen
+magenta until the next full modeset, and the inherited CRTC never gets
+one. Set it as the kernel does. An underflow then costs one frame.
+
+Upstream-Status: Inappropriate [RZ/G3L boot logo, board specific]
+---
+ drivers/video/rzg2l/rzg2l_video.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/video/rzg2l/rzg2l_video.c b/drivers/video/rzg2l/rzg2l_video.c
+index 3bbf60f972..c4842404c1 100644
+--- a/drivers/video/rzg2l/rzg2l_video.c
++++ b/drivers/video/rzg2l/rzg2l_video.c
+@@ -295,7 +295,7 @@ static const uint32_t du_register_values[][2] = {//0x10890000 //use linux value
+ 	{0x1089001c,DU_DITR3_HSA(LCD_HSYNC) | DU_DITR3_HACTIVE(LCD_HACTIVE)},//DU_DITR3
+ 	{0x10890020,DU_DITR4_HBP(LCD_HBACK) | DU_DITR4_HFP(LCD_HFRONT)},//DU_DITR4
+ 	{0x10890024,0x00000000},//DU_DITR5
+-//	{0x10890040,0x00010000},//DU_MCR1 //patch for underflow
++	{0x10890040,0x00010000},//DU_MCR1: PB_AUTOCLR, recover from a PBUF underflow at the next blanking
+ 	{0x1089004c,0x0000001F},//DU_PBCR0
+ 	{0x10890050,0x00000001},//DU_PBCR1 
+ 	{0x10890054,0x00ff00ff},//DU_PBCR2

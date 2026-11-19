@@ -1,0 +1,1916 @@
+From 878d5c53bb947115e7e7d13fc68e7ac33fa4775c Mon Sep 17 00:00:00 2001
+From: Shinji Hirai <shinji.hirai.zn@renesas.com>
+Date: Mon, 3 Aug 2026 09:09:14 +0900
+Subject: [PATCH] add Display Drivers
+
+---
+ cmd/booti.c                        |   7 +
+ common/autoboot.c                  |   8 +
+ common/board_r.c                   |   3 +
+ drivers/video/Makefile             |   1 +
+ drivers/video/rzg2l/Makefile       |   6 +
+ drivers/video/rzg2l/define_1080p.h |  77 +++
+ drivers/video/rzg2l/define_720p.h  |  77 +++
+ drivers/video/rzg2l/dsi_reg.h      | 295 +++++++++
+ drivers/video/rzg2l/rzg2l_def.h    |  82 +++
+ drivers/video/rzg2l/rzg2l_video.c  | 953 +++++++++++++++++++++++++++++
+ drivers/video/rzg2l/rzg2l_video.h  | 277 +++++++++
+ 11 files changed, 1786 insertions(+)
+ create mode 100644 drivers/video/rzg2l/Makefile
+ create mode 100644 drivers/video/rzg2l/define_1080p.h
+ create mode 100644 drivers/video/rzg2l/define_720p.h
+ create mode 100644 drivers/video/rzg2l/dsi_reg.h
+ create mode 100644 drivers/video/rzg2l/rzg2l_def.h
+ create mode 100644 drivers/video/rzg2l/rzg2l_video.c
+ create mode 100644 drivers/video/rzg2l/rzg2l_video.h
+
+diff --git a/cmd/booti.c b/cmd/booti.c
+index b9637b3ec3..4a5f6b4760 100644
+--- a/cmd/booti.c
++++ b/cmd/booti.c
+@@ -17,6 +17,10 @@
+ #include <linux/sizes.h>
+ 
+ DECLARE_GLOBAL_DATA_PTR;
++
++/* Update splach image */
++void rzg2l_video_update(void);
++
+ /*
+  * Image booting support
+  */
+@@ -107,6 +111,9 @@ int do_booti(struct cmd_tbl *cmdtp, int flag, int argc, char *const argv[])
+ 	int states;
+ 	int ret;
+ 
++	/* Update splach image */
++	rzg2l_video_update();
++
+ 	/* Consume 'booti' */
+ 	argc--; argv++;
+ 
+diff --git a/common/autoboot.c b/common/autoboot.c
+index 6f0aeae6bf..ea1562517b 100644
+--- a/common/autoboot.c
++++ b/common/autoboot.c
+@@ -57,6 +57,9 @@ static int menukey;
+ #define AUTOBOOT_MENUKEY 0
+ #endif
+ 
++/* Update splach image */
++void rzg2l_video_update(void);
++
+ /**
+  * passwd_abort_crypt() - check for a crypt-style hashed key sequence to abort booting
+  *
+@@ -405,6 +408,11 @@ static int abortboot_single_key(int bootdelay)
+ 		} while (!abort && get_timer(ts) < 1000);
+ 
+ 		printf("\b\b\b%2d ", bootdelay);
++
++		/* Update splash image */
++		if ((bootdelay == 1) || (bootdelay == 0))
++			rzg2l_video_update();
++
+ 	}
+ 
+ 	putc('\n');
+diff --git a/common/board_r.c b/common/board_r.c
+index da0b80f24f..e6db74269c 100644
+--- a/common/board_r.c
++++ b/common/board_r.c
+@@ -67,6 +67,8 @@
+ #include <efi_loader.h>
+ #include <relocate.h>
+ 
++#include "../drivers/video/rzg2l/rzg2l_video.h"
++
+ DECLARE_GLOBAL_DATA_PTR;
+ 
+ ulong monitor_flash_len;
+@@ -739,6 +741,7 @@ static init_fnc_t init_sequence_r[] = {
+ #if defined(CFG_PRAM)
+ 	initr_mem,
+ #endif
++	rzg2l_video_init,
+ 	run_main_loop,
+ };
+ 
+diff --git a/drivers/video/Makefile b/drivers/video/Makefile
+index f3f70cd04a..6956c8a162 100644
+--- a/drivers/video/Makefile
++++ b/drivers/video/Makefile
+@@ -83,3 +83,4 @@ obj-$(CONFIG_VIDEO_ZYNQMP_DPSUB) += zynqmp/
+ obj-y += bridge/
+ obj-y += sunxi/
+ obj-y += tegra20/
++obj-y += rzg2l/
+diff --git a/drivers/video/rzg2l/Makefile b/drivers/video/rzg2l/Makefile
+new file mode 100644
+index 0000000000..e3f3bd33df
+--- /dev/null
++++ b/drivers/video/rzg2l/Makefile
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: GPL-2.0+
++#
++# (C) Copyright 2026
++# SJX.
++
++obj-y += rzg2l_video.o
+diff --git a/drivers/video/rzg2l/define_1080p.h b/drivers/video/rzg2l/define_1080p.h
+new file mode 100644
+index 0000000000..50820e6dd2
+--- /dev/null
++++ b/drivers/video/rzg2l/define_1080p.h
+@@ -0,0 +1,77 @@
++#ifndef __DSI_DEFINE__
++#define __DSI_DEFINE__
++
++// 1080p 148.5MHz
++#define	CPG_PLL7_CLK1_VAL	0x00527000
++#define	CPG_PLL7_CLK2_VAL	0x00000003
++
++#define	DSI_DPHY_TIM0_VAL	0x000137B9
++#define	DSI_DPHY_TIM1_VAL	0x09090000
++#define	DSI_DPHY_TIM2_VAL	0x06230423
++#define	DSI_DPHY_TIM3_VAL	0x090E0710
++
++//DPHY 250M
++#define DSI_T_INIT		79801
++#define DSI_TCLK_PREPARE	8
++#define DSI_THS_PREPARE		9
++#define DSI_TCLK_SETTLE		9
++#define DSI_THS_SETTLE		9
++#define DSI_TCLK_ZERO		33
++#define DSI_TCLK_PRE		4
++#define DSI_TCLK_POST		35
++#define DSI_TCLK_TRAIL		7
++#define DSI_THS_ZERO		16
++#define DSI_THS_TRAIL		9
++#define DSI_THS_EXIT		13
++#define DSI_TLPX		6
++
++//DSI-LINK
++#define DSI_CLKKPT		12
++#define DSI_CLKBFHT		15
++#define DSI_CLKSTPT		48
++#define DSI_GOLPBKT		75
++#define DSI_DLY			212
++#define DSI_TXESYNC		0
++#define DSI_VIDT		0x3E
++#define DSI_VIVC		0
++#define DSI_HSANOLP		0
++#define DSI_HBPNOLP		0
++#define DSI_HFPNOLP		0
++#define DSI_VSEN		0
++
++// Define For ADV7535
++#define refresh		60	// Frame rate
++#define xres		1920	// resolution x
++#define yres		1080	// resolution y
++#define left_margin	148	// Hback
++#define right_margin	88	// Hfront
++#define upper_margin	36	// Vback
++#define lower_margin	4	// Vfront
++#define hsync_len	44	// Hsync
++#define vsync_len	5	// Vsync
++
++//DU
++#define LCD_HACTIVE	1920	// resolution x
++#define LCD_VACTIVE	1080	// resolution y
++#define LCD_HFRONT	88	// Hfront
++#define LCD_HSYNC	44	// Hsync
++#define LCD_HBACK	148	// Hback
++#define LCD_VFRONT	4	// Vfront
++#define LCD_VSYNC	5	// Vsync
++#define LCD_VBACK	36	// Vback
++#define LCD_VSPOL	1	// vsync polarity
++#define LCD_HSPOL	1	// hsync polarity
++#define LCD_DEMD	0x3
++
++//VSPD
++#define LCD_BPP		24
++#define LCD_VIR		0	//Virtual Input Enable
++#define LCD_RDFMT	0x18
++#define LCD_RDCSC	0	//Color Space Conversion Enable
++#define LCD_SRCM_ADDR	0x58000000
++#define LCD_WRFMT	0x18
++#define LCD_WRCSC	0
++#define LCD_ODE		0
++#define LCD_CFMT	0
++
++#endif //!__DSI_DEFINE__
+diff --git a/drivers/video/rzg2l/define_720p.h b/drivers/video/rzg2l/define_720p.h
+new file mode 100644
+index 0000000000..86fdbf743e
+--- /dev/null
++++ b/drivers/video/rzg2l/define_720p.h
+@@ -0,0 +1,77 @@
++#ifndef __DSI_DEFINE__
++#define __DSI_DEFINE__
++
++// 720P 74.25MHz
++#define	CPG_PLL7_CLK1_VAL	0x04527000
++#define	CPG_PLL7_CLK2_VAL	0x00000003
++
++#define	DSI_DPHY_TIM0_VAL	0x000137B9
++#define	DSI_DPHY_TIM1_VAL	0x0A090000
++#define	DSI_DPHY_TIM2_VAL	0x06230423
++#define	DSI_DPHY_TIM3_VAL	0x090E0810
++
++//DPHY 250M
++#define DSI_T_INIT		79801
++#define DSI_TCLK_PREPARE	8
++#define DSI_THS_PREPARE		9
++#define DSI_TCLK_SETTLE		9
++#define DSI_THS_SETTLE		9
++#define DSI_TCLK_ZERO		33
++#define DSI_TCLK_PRE		4
++#define DSI_TCLK_POST		35
++#define DSI_TCLK_TRAIL		7
++#define DSI_THS_ZERO		16
++#define DSI_THS_TRAIL		9
++#define DSI_THS_EXIT		13
++#define DSI_TLPX		6
++
++//DSI-LINK
++#define DSI_CLKKPT		7
++#define DSI_CLKBFHT		8
++#define DSI_CLKSTPT		27
++#define DSI_GOLPBKT		40
++#define DSI_DLY			212
++#define DSI_TXESYNC		0
++#define DSI_VIDT		0x3E
++#define DSI_VIVC		0
++#define DSI_HSANOLP		0
++#define DSI_HBPNOLP		0
++#define DSI_HFPNOLP		0
++#define DSI_VSEN		0
++
++// Define For ADV7535
++#define refresh		60	// Frame rate
++#define xres		1280	// resolution x
++#define yres		720	// resolution y
++#define left_margin	220	// Hback
++#define right_margin	110	// Hfront
++#define upper_margin	20	// Vback
++#define lower_margin	5	// Vfront
++#define hsync_len	40	// Hsync
++#define vsync_len	5	// Vsync
++
++//DU
++#define LCD_HACTIVE	1280	// resolution x
++#define LCD_VACTIVE	720	// resolution y
++#define LCD_HFRONT	110	// Hfront
++#define LCD_HSYNC	40	// Hsync
++#define LCD_HBACK	220	// Hback
++#define LCD_VFRONT	5	// Vfront
++#define LCD_VSYNC	5	// Vsync
++#define LCD_VBACK	20	// Vback
++#define LCD_VSPOL	1	// vsync polarity
++#define LCD_HSPOL	1	// hsync polarity
++#define LCD_DEMD	0x3
++//VSPD
++#define LCD_BPP		24
++#define LCD_VIR		0	//Virtual Input Enable
++#define LCD_RDFMT	0x18
++#define LCD_RDCSC	0	//Color Space Conversion Enable
++#define LCD_SRCM_ADDR	0x58000000
++#define LCD_WRFMT	0x18
++#define LCD_WRCSC	0
++#define LCD_ODE		0
++#define LCD_CFMT	0
++
++#endif //!__DSI_DEFINE__
++
+diff --git a/drivers/video/rzg2l/dsi_reg.h b/drivers/video/rzg2l/dsi_reg.h
+new file mode 100644
+index 0000000000..f9271c1745
+--- /dev/null
++++ b/drivers/video/rzg2l/dsi_reg.h
+@@ -0,0 +1,295 @@
++//-----------------------------------------------------------------------------
++//! for 1chip sim c program modify
++//-----------------------------------------------------------------------------
++//!@file: dsi_reg_define.sv
++//! - Copyright(C) Renesas Electronics Corp. 2016 All rights reserved
++//! - Copyright(C) Renesas Design Vietnam Co., Ltd  2016 All rights reserved
++//!
++//! $Rev$:
++//! $Date$:
++//! $Author$:
++//!
++//-----------------------------------------------------------------------------
++
++//===========================DSI registers========================    
++#define    ISR                                               0x000
++#define    LINKSR                                            0x010
++#define    GPIR                                              0x080
++#define    GPOR                                              0x084
++#define    TXSETR                                            0x100
++#define    HSCLKSETR                                         0x104
++#define    ULPSSETR                                          0x108
++#define    ULPSCR                                            0x10C
++#define    RSTCR                                             0x110
++#define    RSTSR                                             0x114
++#define    DSISETR                                           0x120
++#define    RXBUFSZR                                          0x124
++#define    TXPPD0R                                           0x160
++#define    TXPPD1R                                           0x164
++#define    TXPPD2R                                           0x168
++#define    TXPPD3R                                           0x16C
++#define    RXSR                                              0x200
++#define    RXSCR                                             0x204
++#define    RXRINFOOWSCR                                      0x23C
++#define    RXRINFOOWSR                                       0x238
++#define    RXIER                                             0x208
++#define    PRESPTOBTASETR                                    0x210
++#define    PRESPTOLPSETR                                     0x214
++#define    PRESPTOHSSETR                                     0x218
++#define    AKEPLATIR                                         0x220
++#define    AKEPACMSR                                         0x224
++#define    AKEPSCR                                           0x228
++#define    RXRSSR                                            0x230
++#define    RXRSSCR                                           0x234
++#define    RXRSS0R                                           0x240
++#define    RXRSS1R                                           0x244
++#define    RXRSS2R                                           0x248
++#define    RXRSS3R                                           0x24C
++#define    VI1RXRSSR                                         0x2A0
++#define    RXPPD0R                                           0x2C0
++#define    RXPPD1R                                           0x2C4
++#define    RXPPD2R                                           0x2C8
++#define    RXPPD3R                                           0x2CC
++#define    HSTXTOSETR                                        0x2E0
++#define    LRXHTOSETR                                        0x2E4
++#define    TATOSETR                                          0x2E8
++#define    FERRSR                                            0x300
++#define    FERRSCR                                           0x304
++#define    FERRIER                                           0x308
++#define    OPMSWTMR                                          0x310
++#define    CLSTPTSETR                                        0x314
++#define    LPTRNSTSETR                                       0x318
++#define    PLSR                                              0x320
++#define    PLSCR                                             0x324
++#define    PLIER                                             0x328
++#define    SCALPSZR                                          0x330
++#define    DLSWAPR                                           0x350
++#define    VIRUNI0R                                          0x360
++#define    VIRUNI1R                                          0x364
++#define    VICH1SET0R                                        0x400
++#define    VICH1SET1R                                        0x404
++#define    VICH1SR                                           0x410
++#define    VICH1SCR                                          0x414
++#define    VICH1IER                                          0x418
++#define    VICH1PPSETR                                       0x420
++#define    VICH1VSSETR                                       0x428
++#define    VICH1VPSETR                                       0x42C
++#define    VICH1HSSETR                                       0x430
++#define    VICH1HPSETR                                       0x434
++#define    TMCR                                              0x540
++#define    TM0SETR                                           0x550
++#define    TM1SETR                                           0x554
++#define    SQRUNIR                                           0x580
++#define    SQCH0SET0R                                        0x5C0
++#define    SQCH0SET1R                                        0x5C4
++#define    SQCH0SR                                           0x5D0
++#define    SQCH0SCR                                          0x5D4
++#define    SQCH0IER                                          0x5D8
++#define    SQCH0DPR                                          0x5E0
++#define    SQCH0DPSETR                                       0x5E4
++#define    SQCH1SET0R                                        0x600
++#define    SQCH1SET1R                                        0x604
++#define    SQCH1SR                                           0x610
++#define    SQCH1SCR                                          0x614
++#define    SQCH1IER                                          0x618
++#define    SQCH1DPR                                          0x620
++#define    SQCH1DPSETR                                       0x624
++#define    SQCH0DSC00AR                                      0x780
++#define    SQCH0DSC00BR                                      0x784
++#define    SQCH0DSC00CR                                      0x788
++#define    SQCH0DSC00DR                                      0x78C
++#define    SQCH0DSC01AR                                      0x790
++#define    SQCH0DSC01BR                                      0x794
++#define    SQCH0DSC01CR                                      0x798
++#define    SQCH0DSC01DR                                      0x79C
++#define    SQCH0DSC02AR                                      0x7A0
++#define    SQCH0DSC02BR                                      0x7A4
++#define    SQCH0DSC02CR                                      0x7A8
++#define    SQCH0DSC02DR                                      0x7AC
++#define    SQCH0DSC03AR                                      0x7B0
++#define    SQCH0DSC03BR                                      0x7B4
++#define    SQCH0DSC03CR                                      0x7B8
++#define    SQCH0DSC03DR                                      0x7BC
++#define    SQCH0DSC04AR                                      0x7C0
++#define    SQCH0DSC04BR                                      0x7C4
++#define    SQCH0DSC04CR                                      0x7C8
++#define    SQCH0DSC04DR                                      0x7CC
++#define    SQCH0DSC05AR                                      0x7D0
++#define    SQCH0DSC05BR                                      0x7D4
++#define    SQCH0DSC05CR                                      0x7D8
++#define    SQCH0DSC05DR                                      0x7DC
++#define    SQCH0DSC06AR                                      0x7E0
++#define    SQCH0DSC06BR                                      0x7E4
++#define    SQCH0DSC06CR                                      0x7E8
++#define    SQCH0DSC06DR                                      0x7EC
++#define    SQCH0DSC07AR                                      0x7F0
++#define    SQCH0DSC07BR                                      0x7F4
++#define    SQCH0DSC07CR                                      0x7F8
++#define    SQCH0DSC07DR                                      0x7FC
++#define    SQCH1DSC00AR                                      0x800
++#define    SQCH1DSC00BR                                      0x804
++#define    SQCH1DSC00CR                                      0x808
++#define    SQCH1DSC00DR                                      0x80C
++#define    SQCH1DSC01AR                                      0x810
++#define    SQCH1DSC01BR                                      0x814
++#define    SQCH1DSC01CR                                      0x818
++#define    SQCH1DSC01DR                                      0x81C
++#define    SQCH1DSC02AR                                      0x820
++#define    SQCH1DSC02BR                                      0x824
++#define    SQCH1DSC02CR                                      0x828
++#define    SQCH1DSC02DR                                      0x82C
++#define    SQCH1DSC03AR                                      0x830
++#define    SQCH1DSC03BR                                      0x834
++#define    SQCH1DSC03CR                                      0x838
++#define    SQCH1DSC03DR                                      0x83C
++#define    SQCH1DSC04AR                                      0x840
++#define    SQCH1DSC04BR                                      0x844
++#define    SQCH1DSC04CR                                      0x848
++#define    SQCH1DSC04DR                                      0x84C
++#define    SQCH1DSC05AR                                      0x850
++#define    SQCH1DSC05BR                                      0x854
++#define    SQCH1DSC05CR                                      0x858
++#define    SQCH1DSC05DR                                      0x85C
++#define    SQCH1DSC06AR                                      0x860
++#define    SQCH1DSC06BR                                      0x864
++#define    SQCH1DSC06CR                                      0x868
++#define    SQCH1DSC06DR                                      0x86C
++#define    SQCH1DSC07AR                                      0x870
++#define    SQCH1DSC07BR                                      0x874
++#define    SQCH1DSC07CR                                      0x878
++#define    SQCH1DSC07DR                                      0x87C
++#define    SQCH1DSC08AR                                      0x880
++#define    SQCH1DSC08BR                                      0x884
++#define    SQCH1DSC08CR                                      0x888
++#define    SQCH1DSC08DR                                      0x88C
++#define    SQCH1DSC09AR                                      0x890
++#define    SQCH1DSC09BR                                      0x894
++#define    SQCH1DSC09CR                                      0x898
++#define    SQCH1DSC09DR                                      0x89C
++#define    SQCH1DSC10AR                                      0x8A0
++#define    SQCH1DSC10BR                                      0x8A4
++#define    SQCH1DSC10CR                                      0x8A8
++#define    SQCH1DSC10DR                                      0x8AC
++#define    SQCH1DSC11AR                                      0x8B0
++#define    SQCH1DSC11BR                                      0x8B4
++#define    SQCH1DSC11CR                                      0x8B8
++#define    SQCH1DSC11DR                                      0x8BC
++#define    SQCH1DSC12AR                                      0x8C0
++#define    SQCH1DSC12BR                                      0x8C4
++#define    SQCH1DSC12CR                                      0x8C8
++#define    SQCH1DSC12DR                                      0x8CC
++#define    SQCH1DSC13AR                                      0x8D0
++#define    SQCH1DSC13BR                                      0x8D4
++#define    SQCH1DSC13CR                                      0x8D8
++#define    SQCH1DSC13DR                                      0x8DC
++#define    SQCH1DSC14AR                                      0x8E0
++#define    SQCH1DSC14BR                                      0x8E4
++#define    SQCH1DSC14CR                                      0x8E8
++#define    SQCH1DSC14DR                                      0x8EC
++#define    SQCH1DSC15AR                                      0x8F0
++#define    SQCH1DSC15BR                                      0x8F4
++#define    SQCH1DSC15CR                                      0x8F8
++#define    SQCH1DSC15DR                                      0x8FC
++#define    SQCH1DSC16AR                                      0x900
++#define    SQCH1DSC16BR                                      0x904
++#define    SQCH1DSC16CR                                      0x908
++#define    SQCH1DSC16DR                                      0x90C
++#define    SQCH1DSC17AR                                      0x910
++#define    SQCH1DSC17BR                                      0x914
++#define    SQCH1DSC17CR                                      0x918
++#define    SQCH1DSC17DR                                      0x91C
++#define    SQCH1DSC18AR                                      0x920
++#define    SQCH1DSC18BR                                      0x924
++#define    SQCH1DSC18CR                                      0x928
++#define    SQCH1DSC18DR                                      0x92C
++#define    SQCH1DSC19AR                                      0x930
++#define    SQCH1DSC19BR                                      0x934
++#define    SQCH1DSC19CR                                      0x938
++#define    SQCH1DSC19DR                                      0x93C
++#define    SQCH1DSC20AR                                      0x940
++#define    SQCH1DSC20BR                                      0x944
++#define    SQCH1DSC20CR                                      0x948
++#define    SQCH1DSC20DR                                      0x94C
++#define    SQCH1DSC21AR                                      0x950
++#define    SQCH1DSC21BR                                      0x954
++#define    SQCH1DSC21CR                                      0x958
++#define    SQCH1DSC21DR                                      0x95C
++#define    SQCH1DSC22AR                                      0x960
++#define    SQCH1DSC22BR                                      0x964
++#define    SQCH1DSC22CR                                      0x968
++#define    SQCH1DSC22DR                                      0x96C
++#define    SQCH1DSC23AR                                      0x970
++#define    SQCH1DSC23BR                                      0x974
++#define    SQCH1DSC23CR                                      0x978
++#define    SQCH1DSC23DR                                      0x97C
++#define    SQCH1DSC24AR                                      0x980
++#define    SQCH1DSC24BR                                      0x984
++#define    SQCH1DSC24CR                                      0x988
++#define    SQCH1DSC24DR                                      0x98C
++#define    SQCH1DSC25AR                                      0x990
++#define    SQCH1DSC25BR                                      0x994
++#define    SQCH1DSC25CR                                      0x998
++#define    SQCH1DSC25DR                                      0x99C
++#define    SQCH1DSC26AR                                      0x9A0
++#define    SQCH1DSC26BR                                      0x9A4
++#define    SQCH1DSC26CR                                      0x9A8
++#define    SQCH1DSC26DR                                      0x9AC
++#define    SQCH1DSC27AR                                      0x9B0
++#define    SQCH1DSC27BR                                      0x9B4
++#define    SQCH1DSC27CR                                      0x9B8
++#define    SQCH1DSC27DR                                      0x9BC
++#define    SQCH1DSC28AR                                      0x9C0
++#define    SQCH1DSC28BR                                      0x9C4
++#define    SQCH1DSC28CR                                      0x9C8
++#define    SQCH1DSC28DR                                      0x9CC
++#define    SQCH1DSC29AR                                      0x9D0
++#define    SQCH1DSC29BR                                      0x9D4
++#define    SQCH1DSC29CR                                      0x9D8
++#define    SQCH1DSC29DR                                      0x9DC
++#define    SQCH1DSC30AR                                      0x9E0
++#define    SQCH1DSC30BR                                      0x9E4
++#define    SQCH1DSC30CR                                      0x9E8
++#define    SQCH1DSC30DR                                      0x9EC
++#define    SQCH1DSC31AR                                      0x9F0
++#define    SQCH1DSC31BR                                      0x9F4
++#define    SQCH1DSC31CR                                      0x9F8
++#define    SQCH1DSC31DR                                      0x9FC
++#define    DBGACR                                            0x700
++#define    DBGIR                                             0x704
++#define    DBGVICH1R                                         0x708
++#define    IBRSETR                                           0x718
++#define    SQCH0TXSETR                                       0x720
++#define    SQCH1TXSETR                                       0x724
++#define    SQRXSETR                                          0x738
++#define    DBGCR                                             0x73C
++#define    DBGSR                                             0x740
++#define    DBGSCR                                            0x744
++#define    DBGIER                                            0x748
++#define    DBGRSTCR                                          0x750
++#define    PPIOPTSETR                                        0x754
++#define    PPIMON0R                                          0x758
++#define    PPIMON1R                                          0x75C
++#define    PPIMON2R                                          0x760
++#define    PPIMON3R                                          0x764
++#define    APPSELR                                           0x768
++#define    APPMONR                                           0x76C
++// DREG
++#define    DPHYCTRL0                                         0x00
++#define    DPHYTIM0                                          0x04
++#define    DPHYTIM1                                          0x08
++#define    DPHYTIM2                                          0x0c
++#define    DPHYTIM3                                          0x10
++#define    DPHYCTRL1                                         0x40
++#define    DPHYTRIM0                                         0x44
++#define    DPHYPPI0                                          0x48
++#define    DPHYTEST0                                         0x4c
++#define    DPHYTEST1                                         0x50
++#define    DPHYEVAL0                                         0x54
++#define    DPHYEVAL1                                         0x58
++#define    DPHYEVAL2                                         0x5c
++#define    DPHYSKW0                                          0x60
++#define    DPHYTERM0                                         0x64
++#define    DPHYDBG0                                          0x68
++#define    DPHYDBG1                                          0x6c
++#define    DPHYDBG2                                          0x70
++#define    DPHYCALHSRX0                                      0x74
+diff --git a/drivers/video/rzg2l/rzg2l_def.h b/drivers/video/rzg2l/rzg2l_def.h
+new file mode 100644
+index 0000000000..2f65166190
+--- /dev/null
++++ b/drivers/video/rzg2l/rzg2l_def.h
+@@ -0,0 +1,82 @@
++/*
++ * Copyright (c) 2020, Renesas Electronics Corporation. All rights reserved.
++ *
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#ifndef __RZG2L_DEF_H__
++#define __RZG2L_DEF_H__
++
++#define RZG2L_SRAM_BASE				(0x00010000)
++#define RZG2L_DEVICE_BASE           (0x10000000)
++#define RZG2L_SCIF0_BASE            (0x1004B800)
++#define RZG2L_SPIMULT_BASE          (0x10060000)
++#define RZG2L_SPIMULT_WBUF_BASE     (0x10070000)
++#define RZG2L_SYC_BASE              (0x11000000)
++#define RZG2L_CPG_BASE              (0x11010000)
++#define RZG2L_SYSC_BASE             (0x11020000)
++#define RZG2L_GPIO_BASE             (0x11030000)
++#define RZG2L_TZC_SPI_BASE          (0x11060000)
++#define RZG2L_TZC_DDR_BASE          (0x11070000)
++#define RZG2L_DDR_PHY_BASE          (0x11400000)
++#define RZG2L_DDR_MEMC_BASE         (0x11410000)
++#define RZG2L_GIC_BASE              (0x11900000)
++#define RZG2L_SD0_BASE              (0x11C00000)
++#define RZG2L_SPIROM_BASE           (0x20000000)
++#define RZG2L_DDR1_BASE             (0x40000000)
++#define RZG2L_DDR2_BASE             (0x80000000)
++#define RZG2L_DDR3_BASE             (0x100000000)
++
++#define RZG2L_GICD_BASE             (RZG2L_GIC_BASE)
++#define RZG2L_GICR_BASE             (RZG2L_GIC_BASE + 0x00040000)
++
++#define RZG2L_SRAM_SIZE				(0x00030000 - RZG2L_SRAM_BASE)
++#define RZG2L_DEVICE_SIZE           (0x15000000 - RZG2L_DEVICE_BASE)
++#define RZG2L_SPIROM_SIZE           (0x30000000 - RZG2L_SPIROM_BASE)
++#define RZG2L_DDR1_SIZE             (RZG2L_DDR2_BASE - RZG2L_DDR1_BASE)
++#define RZG2L_DDR2_SIZE             (RZG2L_DDR3_BASE - RZG2L_DDR2_BASE)
++
++#define RZG2L_SPIROM_FIP_BASE		(RZG2L_SPIROM_BASE + 0x0001D200)
++#define RZG2L_SPIROM_FIP_SIZE		(0x30000000 - RZG2L_SPIROM_FIP_BASE)
++
++#define RZG2L_SYC_INCK_HZ           (24000000)
++#define RZG2L_UART_INCK_HZ          (100000000)
++#define RZG2L_UART_BARDRATE         (115200)
++
++/* Boot Info base address */
++#define RZG2L_BOOTINFO_BASE			(RZG2L_SRAM_BASE)
++
++/* Base address where parameters to BL31 are stored */
++#define PARAMS_BASE					(RZG2L_SRAM_BASE + 0x0001F000)
++#define PARAMS_SIZE					(0x1000)
++
++#define RIIC1_BASE_ADDR				     0x10058400UL
++#define CPG_base_addr                    0x11010000UL
++#define DSI_PHY_base_addr                0x10850000UL
++#define DSI_LINK_base_addr               0x10860000UL
++#define VSPD_base_addr                   0x10870000UL
++#define FCPVD_base_addr                  0x10880000UL
++#define DU_base_addr                     0x10890000UL
++#define USB_Ch1_Host_base_addr           0x11C70000UL
++
++
++
++#define ICCR1			RIIC1_BASE_ADDR + 0x000
++#define ICCR2			RIIC1_BASE_ADDR + 0x004
++#define ICMR1			RIIC1_BASE_ADDR + 0x008
++#define ICMR2			RIIC1_BASE_ADDR + 0x00C
++#define ICMR3			RIIC1_BASE_ADDR + 0x010
++#define ICFER			RIIC1_BASE_ADDR + 0x014
++#define ICSER			RIIC1_BASE_ADDR + 0x018
++#define ICIER			RIIC1_BASE_ADDR + 0x01C
++#define ICSR1			RIIC1_BASE_ADDR + 0x020
++#define ICSR2			RIIC1_BASE_ADDR + 0x024
++#define ICSAR0			RIIC1_BASE_ADDR + 0x028
++#define ICSAR1			RIIC1_BASE_ADDR + 0x02C
++#define ICSAR2			RIIC1_BASE_ADDR + 0x030
++#define ICBRL			RIIC1_BASE_ADDR + 0x034
++#define ICBRH			RIIC1_BASE_ADDR + 0x038
++#define ICDRT			RIIC1_BASE_ADDR + 0x03C
++#define ICDRR			RIIC1_BASE_ADDR + 0x040
++
++#endif /* __RZG2L_DEF_H__ */
+diff --git a/drivers/video/rzg2l/rzg2l_video.c b/drivers/video/rzg2l/rzg2l_video.c
+new file mode 100644
+index 0000000000..ecbf6ec314
+--- /dev/null
++++ b/drivers/video/rzg2l/rzg2l_video.c
+@@ -0,0 +1,953 @@
++#include "rzg2l_video.h"
++#include <common.h>
++#include <command.h>
++
++// PFC
++#define PFC_BASE	0x11030000
++
++#define PFC_PFC25	(PFC_BASE + 0x0494)
++#define PFC_PFC26	(PFC_BASE + 0x0498)
++#define PFC_PFC27	(PFC_BASE + 0x049c)
++#define PFC_PFC28	(PFC_BASE + 0x04a0)
++
++#define PFC_PMC25	(PFC_BASE + 0x0225)
++#define PFC_PMC26	(PFC_BASE + 0x0226)
++#define PFC_PMC27	(PFC_BASE + 0x0227)
++#define PFC_PMC28	(PFC_BASE + 0x0228)
++
++#define PFC_PWPR	(PFC_BASE + 0x3000)
++#define PWPR_B0WI	BIT(7)	// Bit Write Disable
++#define PWPR_PFCWE	BIT(6)	// PFC Register Write Enable
++
++#define PFC_OTHER_POC	(PFC_BASE + 0x3028)
++
++#define ADV7513_I2C_ADDR	0x39
++#define ADV7513_CEC_I2C_ADDR	0x3C
++#define ADV7513_CHIP_REVISION	0x00
++#define ADV7513_POWER		0x41
++#define ADV7513_HPD_CTRL	0xD6
++
++#define	MIPI_DSI_1080P		0
++#define MIPI_DSI_720P		1
++#define	LVDS_720P		2
++#define PARALLEL_RGB_720P	3
++
++#define	DISPLAY_MODE MIPI_DSI_720P
++
++#if (DISPLAY_MODE == MIPI_DSI_1080P)
++#include "define_1080p.h"
++#else
++#include "define_720p.h"
++#endif
++
++/* Frame buffer offset */
++#define LCD_SRCM_ADDR_OFFS	(LCD_HACTIVE * LCD_VACTIVE * DISPLAY_FB_BYTE_PER_PIX)
++
++#define COMPUTE_X(index,width) (((LCD_HACTIVE)-(width))*3/2 + (index)%((width)*3))
++#define COMPUTE_Y(index,width,height) (((LCD_VACTIVE)-(height))/2+(height)-i/3/(width))
++
++#define USE_DISPLAY_LIST
++
++static void rzg2l_cpg_init(void);
++static void adv7535_init(void);
++static void adv7535_deinit(void);
++static void rzg2l_dsi_phy_init(void);
++static void rzg2l_dsi_link_init(void);
++static void rzg2l_fpvcg_init(void);
++static void rzg2l_du_init(void);
++static void rzg2l_vcpd_init(void);
++static void rzg2l_vcpd_dl_init(void);
++static void rzg2l_lcdc_start(void);
++static void wait(int bootdelay);
++
++static void rzg2ul_adv7513_init(void);
++static int adv7513_i2c_reg_write(struct udevice *dev, uint addr, uint mask, uint data);
++static int adv7513_i2c_reg_read(struct udevice *dev, uint8_t addr, uint8_t *data);
++
++int rzg2l_video_init(void){
++
++	// adv7535_deinit();
++	rzg2l_cpg_init();
++
++#if (DISPLAY_MODE == PARALLEL_RGB_720P)
++	// Disable GPIO Write Protect
++	(*(volatile u32 *)PFC_PWPR) &= ~(0x1u << 7);	// PWPR.BOWI  = 0
++	(*(volatile u32 *)PFC_PWPR) |= (0x1u << 6);	// PWPR.PFCWE = 1
++
++	*(volatile u32 *)(PFC_OTHER_POC) |= 0x02;	// PVDD_1833_OTH_ISO_POC = 1.8V
++
++	*(volatile u32 *)(PFC_PFC25) = 0x01111111;
++	*(volatile u32 *)(PFC_PFC26) = 0x01111111;
++	*(volatile u32 *)(PFC_PFC27) = 0x11111111;
++	*(volatile u32 *)(PFC_PFC28) = 0x00111111;
++
++	*(volatile u8 *)(PFC_PMC25) = 0x7F;
++	*(volatile u8 *)(PFC_PMC26) = 0x7F;
++	*(volatile u8 *)(PFC_PMC27) = 0xFF;
++	*(volatile u8 *)(PFC_PMC28) = 0x3F;
++
++	// Enable GPIO write Protect
++	*(volatile u32 *)(PFC_PWPR) = 0;
++	*(volatile u32 *)(PFC_PWPR) = PWPR_B0WI;
++
++	rzg2ul_adv7513_init();
++#else
++	rzg2l_dsi_phy_init();
++	rzg2l_dsi_link_init();
++
++	adv7535_init();
++#endif
++
++	/* Load image data for splash screen */
++#if (DISPLAY_MODE == MIPI_DSI_1080P)
++	run_command("ext4load mmc 0:1 0x48000000 boot_img_1080p.bin.gz",0);
++#else
++	run_command("ext4load mmc 0:1 0x48000000 boot_img_720p.bin.gz",0);
++#endif
++	run_command("unzip 0x48000000 0x58000000",0);
++	dcache_disable();
++
++	// rzg2l_fpvcg_init();
++
++	rzg2l_du_init();
++
++#ifdef	USE_DISPLAY_LIST
++	rzg2l_vcpd_dl_init();
++#else
++	rzg2l_vcpd_init();
++#endif	/* USE_DISPLAY_LIST */
++
++	dcache_enable();
++
++	rzg2l_lcdc_start();
++
++	/* Added this delay to display the first FB image.
++	 * This may be removed when an HDMI monitor display is not used.
++	 */
++	wait(1);
++
++	return 0;
++}
++
++static const uint32_t cpg_register_values[][2] = {//0x11010000  //step1
++#if (DISPLAY_MODE == PARALLEL_RGB_720P)
++	{0x11010084, 0x104C4000}, // CPG_PLL7_CLK1
++	{0x11010088, 0x00000003}, // CPG_PL7_CLK2
++#else
++	{0x11010084, CPG_PLL7_CLK1_VAL}, // CPG_PLL7_CLK1
++	{0x11010088, CPG_PLL7_CLK2_VAL}, // CPG_PL7_CLK2
++#endif
++#if (DISPLAY_MODE == PARALLEL_RGB_720P)
++	{0x11010408, 0x00010001}, // CPG_DSI_SSEL
++#else
++	{0x11010228, 0x00010000}, // CPG_DSI_DDIV
++	{0x11010408, 0x00010001}, // CPG_DSI_SSEL
++	{0x11010430, 0x00110022}, // CPG_DSI_SDIV
++#endif
++	{0x11010080, 0x00150011}, // CPG_PLL7_STBY
++#if (DISPLAY_MODE != PARALLEL_RGB_720P)
++	{0x11010568, 0x003e003e}, // CPG_CLKON_MIPI_DSI
++#endif
++	{0x1101056c, 0x00070007}, // CPG_CLKON_LCDC
++	{0x11010580, 0x000f000f}, // CPG_CLKON_I2C
++};
++
++static const uint32_t cpg_register_values1[][2] = {//0x11010000 //step2
++#if (DISPLAY_MODE != PARALLEL_RGB_720P)
++	{0x11010868, 0x00070007},/*CPG_RST_MIPI_DSI*/
++#endif
++	{0x1101086c, 0x00010001},/*CPG_RST_LCDC*/
++	{0x11010880, 0x000f000f},/*CPG_RST_I2C*/
++};
++
++static const uint32_t dsi_phy_register_values[][2] = {//0x10850000
++	{0x00000000, 1},// wait us
++#if 1
++	{0x10850004, DSI_DPHY_TIM0_VAL }, // DSI_DPHY_TIM0
++	{0x10850008, DSI_DPHY_TIM1_VAL }, // DSI_DPHY_TIM1
++	{0x1085000c, DSI_DPHY_TIM2_VAL }, // DSI_DPHY_TIM2
++	{0x10850010, DSI_DPHY_TIM3_VAL }, // DSI_DPHY_TIM3
++#else	/* 1 */
++	{0x10850004, DSIDPHYTIM0_TCLK_MISS(1) | DSIDPHYTIM0_T_INIT(DSI_T_INIT)},//DPHYTIM0
++	{0x10850008, DSIDPHYTIM1_THS_PREPARE(DSI_THS_PREPARE) | DSIDPHYTIM1_TCLK_PREPARE(DSI_TCLK_SETTLE) |DSIDPHYTIM1_THS_SETTLE(DSI_THS_SETTLE) |DSIDPHYTIM1_TCLK_SETTLE(DSI_TCLK_SETTLE)},//DPHYTIM1
++	{0x1085000c, DSIDPHYTIM2_TCLK_TRAIL(DSI_TCLK_TRAIL) | DSIDPHYTIM2_TCLK_POST(DSI_TCLK_POST) | DSIDPHYTIM2_TCLK_PRE(DSI_TCLK_PRE) | DSIDPHYTIM2_TCLK_ZERO(DSI_TCLK_ZERO)},//DPHYTIM2
++	{0x10850010, DSIDPHYTIM3_TLPX(DSI_TLPX) | DSIDPHYTIM3_THS_EXIT(DSI_THS_EXIT) | DSIDPHYTIM3_THS_TRAIL(DSI_THS_TRAIL) | DSIDPHYTIM3_THS_ZERO(DSI_THS_ZERO)},//DPHYTIM3
++//	{0x10850040, 0x00000001},//DPHYCTRL1 //linux:no this reg
++//	{0x10850044, 0x5A8BBBBB},//DPHYTRIM0 //linux:no this reg
++	{0x10850000, 0x00010105},//DPHYCTRL0
++#endif	/* 1 */
++	{0x00000000, 20},// wait us
++	{0x10850000, 0x00010107},//DPHYCTRL0
++	{0x00000000, 10},// wait us
++	{0x11010868, 0x00010001},/*CPG_RST_MIPI_DSI*/
++};
++
++static const uint32_t dsi_link_register_values[][2] = {//0x10860000 //use linux value
++	// {0x00000000,1000},// wait us
++//	{0x10860000,0x00000000},//ISR
++//	{0x10860010,0x00001100},//LINKSR
++	{0x10860100,0x00030303},//TXSETR
++	{0x10860108,0x000000A0},//ULPSSETR
++//	{0x1086010c,0x00000000},//ULPSCR
++//	{0x10860110,0x00000000},//RSTCR
++//	{0x10860114,0x00000000},//RSTSR
++	{0x10860120,0x80F10001},//DSISETR
++//	{0x10860124,0x00000000},//RXBUFSZR
++//	{0x10860160,0x00000000},//TXPPD0R
++//	{0x10860164,0x00000000},//TXPPD1R
++//	{0x10860168,0x00000000},//TXPPD2R
++//	{0x1086016c,0x00000000},//TXPPD3R
++//	{0x10860200,0x00000000},//RXSR
++//	{0x10860204,0x00000000},//RXSCR
++//	{0x1086020c,0x00000000},
++	{0x10860210,0x00000000},//PRESPTOBTASETR
++	{0x10860214,0x00000000},//PRESPTOLPSETR
++	{0x10860218,0x00000000},//PRESPTOHSSETR
++//	{0x1086021c,0x00000000},
++//	{0x10860220,0x00000000},//AKEPLATIR
++//	{0x10860224,0x00000000},//AKEPACMSR
++//	{0x10860228,0x00000000},//AKEPSCR
++//	{0x10860230,0x00000000},//RXRSSR
++//	{0x10860234,0x00000000},//RXRSSCR
++//	{0x10860238,0x00000000},//RXRINFOOWSR
++//	{0x1086023c,0x00000000},//RXRINFOOWSCR
++//	{0x10860240,0x00000000},//RXRSS0R
++//	{0x10860244,0x00000000},//RXRSS1R
++//	{0x10860248,0x00000000},//RXRSS2R
++//	{0x1086024c,0x00000000},//RXRSS3R
++//	{0x108602c0,0x00000000},//RXPPD0R
++//	{0x108602c4,0x00000000},//RXPPD1R
++//	{0x108602c8,0x00000000},//RXPPD2R
++//	{0x108602cc,0x00000000},//RXPPD3R
++	{0x108602e0,0x00000000},//HSTXTOSETR
++	{0x108602e4,0x00000000},//LRXHTOSETR
++	{0x108602e8,0x00000000},//TATOSETR
++//	{0x10860300,0x00000000},//FERRSR
++//	{0x10860304,0x00000000},//FERRSCR
++//	{0x10860310,0x000000FF},//OPMSWTMR  //doc: no defination
++	{0x10860314,CLSTPTSETR_CLKKPT(DSI_CLKKPT) | CLSTPTSETR_CLKBFHT(DSI_CLKBFHT) | CLSTPTSETR_CLKSTPT(DSI_CLKSTPT)},//CLSTPTSETR
++	{0x10860318,LPTRNSTSETR_GOLPBKT(DSI_GOLPBKT)},//LPTRNSTSETR
++//	{0x10860320,0x040000F1},//PLSR
++//	{0x10860324,0x00000000},//PLSCR
++//	{0x10860410,0x0000000D},//VICH1SR
++//	{0x10860414,0x00000000},//VICH1SCR
++//	{0x108605c0,0x00800000},//SQCH0SET0R
++//	{0x108605c4,0x08000000},//SQCH0SET1R
++//	{0x108605d0,0x00000000},//SQCH0SR
++//	{0x108605d4,0x00000000},//SQCH0SCR
++//	{0x10860600,0x00800000},//SQCH1SET0R
++//	{0x10860604,0x08300000},//SQCH1SET1R
++//	{0x10860610,0x00000000},//SQCH1SR
++//	{0x10860614,0x00000000},//SQCH1SCR
++	{0x10860208,0x17F7FF01},//RXIER
++	{0x10860308,0x001F0007},//FERRIER
++	{0x10860328,0x3F003000},//PLIER
++	{0x10860418,0x7CF0000B},//VICH1IER
++	{0x108605d8,0x7D490110},//SQCH0IER
++	{0x10860618,0x7D490110},//SQCH1IER
++	{0x10860104,0x00000003},//HSCLKSETR
++	{0x10860420,0x003E8000},//VICH1PPSETR
++	{0x10860428,VICH1VSSETR_VACTIVE(LCD_VACTIVE) | VICH1VSSETR_VSA(LCD_VSYNC)},//VICH1VSSETR
++//	{0x10860428,(LCD_VSYNC << 0) | (LCD_VSPOL << 15) | (LCD_VACTIVE << 16)},//VICH1VSSETR
++	{0x1086042c,VICH1VPSETR_VFP(LCD_VFRONT) | VICH1VPSETR_VBP(LCD_VBACK)},//VICH1VPSETR
++	{0x10860430,VICH1HSSETR_HACTIVE(LCD_HACTIVE) | VICH1HSSETR_HSA(LCD_HSYNC)},//VICH1HSSETR
++//	{0x10860430,(LCD_HSYNC << 0) | (LCD_HSPOL << 15) | (LCD_HACTIVE << 16)},//VICH1HSSETR
++	{0x10860434,VICH1HPSETR_HFP(LCD_HFRONT) | VICH1HPSETR_HBP(LCD_HBACK)},//VICH1HPSETR
++	{0x10860404,VICH1SET1R_DLY(DSI_DLY)},//VICH1SET1R
++//	{0x10860404,(DSI_DLY << 2)},//VICH1SET1R
++	{0x10860400,0x00000701},//VICH1SET0R //last bit is Video-Input Operation Start
++//	{0x10860400,0x00000001},//VICH1SET0R //last bit is Video-Input Operation Start
++};
++
++static const uint32_t fcpvd_register_values[][2] = {//0x10880000
++	{0x10880000,0x00000109},
++	{0x10880004,0x00000000},
++	{0x10880010,0x00000000},
++	{0x10880018,0x00000000},
++};
++
++static const uint32_t du_register_values[][2] = {//0x10890000 //use linux value
++//	{0x10890000,0x00010100},//DU_MCR0
++//	{0x10890004,0x00010100},//DU_MSR0
++//	{0x10890008,0x00000000},//DU_MSR1
++	{0x1089000c,0x00000000},//DU_IMR0
++	{0x10890010,(1 << 8 ) | (1 << 9) | (LCD_VSPOL << 16) | (LCD_HSPOL << 17)},//DU_DITR0
++	{0x10890014,DU_DITR1_VSA(LCD_VSYNC) | DU_DITR1_VACTIVE(LCD_VACTIVE)},//DU_DITR1
++	{0x10890018,DU_DITR2_VBP(LCD_VBACK) | DU_DITR2_VFP(LCD_VFRONT)},//DU_DITR2
++	{0x1089001c,DU_DITR3_HSA(LCD_HSYNC) | DU_DITR3_HACTIVE(LCD_HACTIVE)},//DU_DITR3
++	{0x10890020,DU_DITR4_HBP(LCD_HBACK) | DU_DITR4_HFP(LCD_HFRONT)},//DU_DITR4
++	{0x10890024,0x00000000},//DU_DITR5
++//	{0x10890040,0x00010000},//DU_MCR1 //patch for underflow
++	{0x1089004c,0x0000001F},//DU_PBCR0
++	{0x10890050,0x00000001},//DU_PBCR1 
++	{0x10890054,0x00ff00ff},//DU_PBCR2
++};
++
++static const uint32_t vcpd_register_values[][2] = {//0x10870000  //still picture output
++	{0x10870000, 0x00000000}, // VI6_CMD0
++//	{0x10870000, 0x10010F1F}, // VI6_CLK_CTRL0
++//	{0x10870000, 0xFF10FFFF}, // VI6_CLK_CTRL1
++	{0x10870018, 0x00000808}, // VI6_CLK_DCSWT
++	{0x10870028, 0x00000001}, // VI6_SRESET
++//	{0x10870038, 0x00000000}, // VI6_STATUS: cmp32 = 0x00000000
++	{0x10870048, 0x00000000}, // VI6_WPF0_IRQ_ENB
++	// {0x10870048, 0x00011003}, // VI6_WPF0_IRQ_ENB
++//	{0x1087004C, 0x00000000}, // VI6_WPF0_IRQ_STA: cmp32 = 0x00000000
++	{0x10870100, 0x00000007}, // VI6_DL_CTRL
++	{0x10870114, 0x00000000}, // VI6_DL_SWAP0
++	{0x10870120, 0x00000002}, // VI6_DL_BODY_SIZE0
++//	{0x10870130, 0x00000000}, 				// VI6_DL_HDR_REF_ADDR0: cmp32 = 0x00000000
++	{0x10870158, 0x00000000}, // VI6_DL_WUPCNT0
++	{0x10870300, (LCD_VACTIVE << 0) | (LCD_HACTIVE << 16)}, // VI6_RPF_SRC_BSIZE: BVSIZE, BHSIZE
++	{0x10870304, (LCD_VACTIVE << 0) | (LCD_HACTIVE << 16)}, // VI6_RPF_SRC_DSIZE: EVSIZE, EHSIZE
++	{0x10870308, (LCD_RDFMT << 0) | (LCD_RDCSC << 8) | (LCD_VIR<<28)}, // VI6_RPF_INFMT: RDFMT, CSC
++//	{0x10870308, 0x00000018}, // VI6_RPF_INFMT: RDFMT, CSC
++	{0x10870310, 0x00000000}, // VI6_RPF_LOC
++	{0x1087030C, 0x00000F0F}, // VI6_RPF_DSWAP
++	{0x10870318, 0xFF0000FF}, // VI6_RPFn_VRTCOL_SET
++	{0x10870334, ((LCD_HACTIVE * 1) << 0) | ((LCD_HACTIVE * 3) << 16)}, // VI6_RPF_SRCM_STRIDE: PICT_STRD_C, PICT_STRD_Y
++	{0x1087033C, LCD_SRCM_ADDR}, // VI6_RPF_SRCM_ADDR_Y: SRCM_ADDR_Y=DDR Address
++	{0x10871000, 0x00000002}, // VI6_WPF0_SRCRPF: RPF0 is master
++//	{0x1087100C, 0xFF000018},// VI6_WPF0_OUTFMT: WRFMT, CSC, ODE
++	{0x1087100C, (LCD_WRFMT << 0) | (LCD_WRCSC << 8) | (LCD_ODE << 22) | (0xFF << 24)},// VI6_WPF0_OUTFMT: WRFMT, CSC, ODE
++	{0x10871010, 0x0000000F}, // VI6_WPF_DSWAP
++	{0x10872000, (56 << 0) }, // VI6_DPR_RPF0_ROUTE: RT_RPF0=WPF0
++	{0x10872004, (0x3F << 0)},// VI6_DPR_RPF1_ROUTE: RT_RPF1=UNUSED
++	{0x10872014, 0x00000500}, // VI6_DPR_WPF0_FPORCH
++	{0x10872050, (0x3F << 0) | (0 << 8) | (1 << 28)}, // VI6_DPR_ILV_BRS_ROUTE: RT=UNUSED, FP=0, IIFSEL=BRS
++	{0x10873B00, (1 << 0) | (1 << 1) | (LCD_CFMT << 4) | (1500 << 16)}, // VI6_LIF0_CTRL: LIF_EN=1, REQSEL=1, CFMT, OBTH=1500
++	{0x10873B04, 0x00000000 | (1500 << 16)}, // VI6_LIF0_CSBTH
++	{0x10873B0C, (1536 << 16) | (1 << 31)}, // VI6_LIF0_LBA: LBA1=1536, LBA0=1
++	{0x10873900, 0x00000000}, // VI6_BRS_INCTRL
++	{0x10873910, (0x0 << 0) | (0x0 << 4) | (0x1 << 16) | (0x0 << 20) | (1 << 31)},  // VI6_BRSA_CTRL
++	{0x10873914, (0x00 << 0) | (0x00 << 8) | (0x4 << 16) | (0x4 << 20) | (0 << 23) | (0x3 << 24) | (0x2 << 28) | (0 << 31)}, // VI6_BRSA_BLD
++	{0x10873918, (0x0 << 0) | (0x0 << 4) | (0 << 31)}, // VI6_BRSB_CTRL
++	{0x10870104, 0x00000000}, // VI6_DL_HDR_ADDR0
++};
++
++/* Write Read Register */
++#define reg_write(addr,val)     writel((val),((uint64_t)addr))
++#define reg_read(addr)          readl(addr)
++
++/* Write Block */
++static void rzg2l_registers_set(const uint32_t (*arr)[2], uint32_t len)
++{
++	for(int i=0;i<len;i++){
++		if(arr[i][0]==0)    udelay(arr[i][1]);
++		else                writel(arr[i][1],((uint64_t)(arr[i][0])));
++	}
++}
++
++/* I2C Write Register */
++static int adv7535_i2c_reg_write(struct udevice *dev, uint addr, uint mask, uint data)
++{
++    uint8_t valb;
++    int err;
++
++    if (mask != 0xff)
++    {
++        err = dm_i2c_read(dev, addr, &valb, 1);
++        if (err)
++            return err;
++
++        valb &= ~mask;
++        valb |= data;
++    }
++    else
++    {
++        valb = data;
++    }
++
++    err = dm_i2c_write(dev, addr, &valb, 1);
++    return err;
++}
++
++/* I2C Read Register */
++static int adv7535_i2c_reg_read(struct udevice *dev, uint8_t addr, uint8_t *data)
++{
++    uint8_t valb;
++    int err;
++
++    err = dm_i2c_read(dev, addr, &valb, 1);
++    if (err)
++        return err;
++
++    *data = (int)valb;
++    return 0;
++}
++
++/* Init MIPI CPG & LCDC CPG */
++static void rzg2l_cpg_init(void){
++    rzg2l_registers_set(cpg_register_values,ARRAY_SIZE(cpg_register_values));
++
++    // wait clock on
++#if (DISPLAY_MODE != PARALLEL_RGB_720P)
++    while ((reg_read(CPG_base_addr + 0x06E8) & 0x0000003E) != 0x0000003E); // CPG_CLKMON_MIPI_DSI
++#endif
++    while ((reg_read(CPG_base_addr + 0x06EC) & 0x00000003) != 0x00000003); // CPG_CLKMON_LCDC
++	
++    rzg2l_registers_set(cpg_register_values1,ARRAY_SIZE(cpg_register_values1));
++	
++    // wait reset on
++#if (DISPLAY_MODE != PARALLEL_RGB_720P)
++    while ((reg_read(CPG_base_addr + 0x09E8) & 0x00000006) != 0x00000000); // CPG_RSTMON_MIPI_DSI: MIPI_DSI_ARESET_N=1, MIPI_DSI_PRESET_N=1
++#endif
++    while ((reg_read(CPG_base_addr + 0x09EC) & 0x00000001) != 0x00000000); // CPG_RSTMON_LCDC
++}
++
++#if (DISPLAY_MODE != PARALLEL_RGB_720P)
++/* ADV7535 Fix Register Set */
++static void adv7535_setup_cfg(struct udevice *dev, struct udevice *dev_cec)
++{
++    /* Initialisation (Fixed) Registers */
++    adv7535_i2c_reg_write(dev, 0x16,0xff, 0x20);
++    adv7535_i2c_reg_write(dev, 0x9A,0xff, 0xE0);
++    adv7535_i2c_reg_write(dev, 0xBA,0xff, 0x70);
++    adv7535_i2c_reg_write(dev, 0xDE,0xff, 0x82);
++    adv7535_i2c_reg_write(dev, 0xE4,0xff, 0x40);
++    adv7535_i2c_reg_write(dev, 0xE5,0xff, 0x80);
++
++    adv7535_i2c_reg_write(dev, 0xE1, 0xff, ADV7535_DSI_CEC_ADDR);
++
++    adv7535_i2c_reg_write(dev_cec, 0x15, 0xff,0xD0);
++    adv7535_i2c_reg_write(dev_cec, 0x17, 0xff,0xD0);
++    adv7535_i2c_reg_write(dev_cec, 0x24, 0xff,0x20);
++    adv7535_i2c_reg_write(dev_cec, 0x57, 0xff,0x11);
++    adv7535_i2c_reg_write(dev_cec, 0x05, 0xff,0xc8);
++}
++
++/* ADV7537 Screen Param Register Set */
++static void adv7535_vmode_cfg(struct udevice *dev, struct udevice *dev_cec)
++{
++    uint32_t low, high;
++    uint32_t line_length, frame_height;
++
++    line_length = xres + left_margin + right_margin + hsync_len;
++    frame_height = yres + upper_margin + lower_margin + vsync_len;
++
++    adv7535_i2c_reg_write(dev_cec, 0x1C, 0xff,0x40);              /* 4 Data Lanes */
++    adv7535_i2c_reg_write(dev_cec, 0x16, 0xff,0x18);              /* Pixel Clock  */ // div 3
++    adv7535_i2c_reg_write(dev_cec, 0x27, 0xff,0xCB);              /* INT_TIMING_GEN */
++
++    /* video mode settings */
++    low = (line_length << 4);
++    high = (line_length >> 4);
++    adv7535_i2c_reg_write(dev_cec, 0x28, 0xff,high); /* Total Line Length */
++    adv7535_i2c_reg_write(dev_cec, 0x29, 0xff,low);
++
++    low = (hsync_len << 4);
++    high = (hsync_len >> 4);
++    adv7535_i2c_reg_write(dev_cec, 0x2A, 0xff,high); /* Hsync Active Width */
++    adv7535_i2c_reg_write(dev_cec, 0x2B, 0xff,low);
++
++    low = (right_margin << 4);
++    high = (right_margin >> 4);
++    adv7535_i2c_reg_write(dev_cec, 0x2C,0xff,high); /* Horizontal FP Width */
++    adv7535_i2c_reg_write(dev_cec, 0x2D,0xff,low);
++
++    low = (left_margin << 4);
++    high = (left_margin >> 4);
++    adv7535_i2c_reg_write(dev_cec, 0x2E, 0xff,high); /* Horizontal BP Width */
++    adv7535_i2c_reg_write(dev_cec, 0x2F, 0xff,low);
++
++    low = (frame_height << 4);
++    high = (frame_height >> 4);
++    adv7535_i2c_reg_write(dev_cec, 0x30, 0xff,high); /* Total Frame Height */
++    adv7535_i2c_reg_write(dev_cec, 0x31, 0xff,low);
++
++    low = (vsync_len << 4);
++    high = (vsync_len >> 4);
++    adv7535_i2c_reg_write(dev_cec, 0x32,0xff,high); /* Vsync Active Height */
++    adv7535_i2c_reg_write(dev_cec, 0x33,0xff,low);
++
++    low = (lower_margin << 4);
++    high = (lower_margin >> 4);
++    adv7535_i2c_reg_write(dev_cec, 0x34,0xff, high); /* Vertical FP Height */
++    adv7535_i2c_reg_write(dev_cec, 0x35,0xff, low);
++
++    low = (upper_margin << 4);
++    high = (upper_margin >> 4);
++    adv7535_i2c_reg_write(dev_cec, 0x36, 0xff,high); /* Vertical BP Height */
++    adv7535_i2c_reg_write(dev_cec, 0x37, 0xff,low);
++
++    /* Reset Internal Timing Generator */
++    adv7535_i2c_reg_write(dev_cec, 0x27, 0xff,0xCB);
++    adv7535_i2c_reg_write(dev_cec, 0x27, 0xff,0x8B);
++    adv7535_i2c_reg_write(dev_cec, 0x27, 0xff,0xCB);        // 重置时序 
++
++    adv7535_i2c_reg_write(dev_cec, 0x03, 0xff,0x89);        // HDMI 输出使能
++    adv7535_i2c_reg_write(dev_cec, 0x55, 0xff,0x00);        // 关闭测试图案
++
++    adv7535_i2c_reg_write(dev, 0xAF, 0xff,0x16); /* HDMI Output */ // 设置为HDMI 输出
++    adv7535_i2c_reg_write(dev, 0x55, 0xff,0x02); /* AVI Info-frame */
++    adv7535_i2c_reg_write(dev, 0x56, 0xff,0x28); /* 16:9 */
++    adv7535_i2c_reg_write(dev, 0x40, 0xff,0x00); /* GCP Enable */
++    adv7535_i2c_reg_write(dev, 0x4C, 0xff,0x00); /* 24bpp */
++
++    adv7535_i2c_reg_write(dev, 0x49, 0xff, 0x00); // 8 deth
++
++    /* low refresh rate */
++    if (refresh < 50)
++        adv7535_i2c_reg_write(dev, 0x4A, 0xff, 0x8C);
++
++    /*TODO Audio Setup */
++    adv7535_i2c_reg_write(dev_cec, 0xBE, 0xff, 0x3D); /* CEC Power Mode */
++
++    /* Power */
++    adv7535_i2c_reg_write(dev, 0x41, 0xff,0x10);
++    adv7535_i2c_reg_write(dev, 0xd6, 0xff,0xC8);
++
++    adv7535_i2c_reg_write(dev, 0xAF, 0xff, 0x06); /* HDMI Output */ // 设置为HDMI 输出
++
++    adv7535_i2c_reg_write(dev_cec, 0x11, 0xff,0x09);
++    adv7535_i2c_reg_write(dev_cec, 0x81, 0xff,0x06);//CEC_TX_RETRY
++
++    adv7535_i2c_reg_write(dev_cec, 0x03, 0xff,0x89);
++    adv7535_i2c_reg_write(dev_cec, 0x55, 0xff,0x00);
++
++    adv7535_i2c_reg_write(dev_cec, 0x05, 0xff,0xC8);
++
++    adv7535_i2c_reg_write(dev, 0xE2,0xff, 0x00);
++    adv7535_i2c_reg_write(dev, 0xD6,0xff, 0x48);
++    adv7535_i2c_reg_write(dev, 0xC9,0xff, 0x13);
++}
++
++static void adv7535_power_off(struct udevice *dev, struct udevice *dev_cec){
++    adv7535_i2c_reg_write(dev, 0x50, 0xff,0x10);
++}
++
++/* Init ADV7535 */
++static void adv7535_init(void){
++    struct udevice *bus = NULL, *dev = NULL, *dev_cec = NULL;
++    uint8_t val = 0;
++
++    /* Get I2C Bus */
++    if (uclass_get_device_by_name(UCLASS_I2C, "i2c@10090800", &bus)){
++        puts("Cannot find MCU bus! Can not disable MCU WDT.\n");
++        return;
++    }
++
++    /* Get CEC Device */
++    val = i2c_get_chip(bus, 0x3C, 1, &dev_cec);
++    if (val){
++        puts("Cannot get 0x3C!\n");
++        return;
++    }
++
++    /* Get Device */
++    val = i2c_get_chip(bus, 0x3D, 1, &dev);
++    if (val){
++        puts("Cannot get 0x3D!\n");
++        return;
++    }
++
++    adv7535_setup_cfg(dev, dev_cec);
++    adv7535_vmode_cfg(dev, dev_cec);
++}
++
++/* Init ADV7535 */
++static void adv7535_deinit(void){
++    struct udevice *bus = NULL, *dev = NULL, *dev_cec = NULL;
++    uint8_t val = 0;
++
++    /* Get I2C Bus */
++    if (uclass_get_device_by_name(UCLASS_I2C, "i2c@10090800", &bus)){
++        puts("Cannot find MCU bus! Can not disable MCU WDT.\n");
++        return;
++    }
++
++    /* Get CEC Device */
++    val = i2c_get_chip(bus, 0x3C, 1, &dev_cec);
++    if (val){
++        puts("Cannot get 0x3C!\n");
++        return;
++    }
++
++    /* Get Device */
++    val = i2c_get_chip(bus, 0x3D, 1, &dev);
++    if (val){
++        puts("Cannot get 0x3D!\n");
++        return;
++    }
++
++    adv7535_power_off(dev, dev_cec);
++}
++
++/* Init DSI PHY */
++static void rzg2l_dsi_phy_init(void){
++	rzg2l_registers_set(dsi_phy_register_values,ARRAY_SIZE(dsi_phy_register_values));
++    while ((reg_read(CPG_base_addr + 0x09E8) & 0x00000007) != 0x00000000);// CPG_RSTMON_MIPI_DSI: MIPI_DSI_CMN_RSTB=1, MIPI_DSI_ARESET_N=1, MIPI_DSI_PRESET_N=1
++}
++
++/* Init DSI Link */
++static void rzg2l_dsi_link_init(void){
++    rzg2l_registers_set(dsi_link_register_values,ARRAY_SIZE(dsi_link_register_values));
++    while ((reg_read(DSI_LINK_base_addr + VICH1SR) & 0x00000008) != 0x00000008);
++}
++#endif	/* DISPLAY_MODE != PARALLEL_RGB_720P	*/
++
++#if (DISPLAY_MODE == PARALLEL_RGB_720P)
++struct reg_sequence
++{
++	uint8_t reg;
++	uint8_t def;
++};
++
++static const struct reg_sequence adv7513_fixed_registers[] = {
++	{0x41, 0x10},
++	{0x98, 0x03},
++	{0x9a, 0xe0},
++	{0x9c, 0x30},
++	{0x9d, 0x61},
++	{0xa2, 0xa4},
++	{0xa3, 0xa4},
++	{0xe0, 0xd0},
++	{0xf9, 0x00},
++	{0x55, 0x02},
++	{0x44, 0x00},
++	{0x43, 0x7e},
++	{0x45, 0x70},
++	{0xe1, 0x78},
++	{0x16, 0x38},
++	{0x48, 0x10},
++	{0xD0, 0x0C},
++	{0xba, 0x60},
++	{0xe2, 0x01},
++	{0xaf, 0x14},
++	{0x96, 0x80},
++	{0x98, 0x03},
++	{0x9A, 0xE0},
++	{0x9C, 0x30},
++	{0x9D, 0x61},
++	{0xA2, 0xA4},
++	{0xA3, 0xA4},
++	{0xE0, 0xD0},
++	{0xF9, 0x00},
++	{0x55, 0x02},
++	{0x16, 0x38},
++	{0x41, 0x10},
++	{0x44, 0x10},
++	{0x48, 0x10},
++	{0xAF, 0x16},
++	{0xBA, 0x60},
++	{0xD0, 0x0C},
++	{0xD6, 0xC0},
++};
++
++/* I2C Write Register */
++static int adv7513_i2c_reg_write(struct udevice *dev, uint addr, uint mask, uint data)
++{
++    uint8_t valb;
++    int err;
++
++    if (mask != 0xff)
++    {
++        err = dm_i2c_read(dev, addr, &valb, 1);
++        if (err)
++            return err;
++
++        valb &= ~mask;
++        valb |= data;
++    }
++    else
++    {
++        valb = data;
++    }
++
++    err = dm_i2c_write(dev, addr, &valb, 1);
++    return err;
++}
++
++/* I2C Read Register */
++static int adv7513_i2c_reg_read(struct udevice *dev, uint8_t addr, uint8_t *data)
++{
++    uint8_t valb;
++    int err;
++
++    err = dm_i2c_read(dev, addr, &valb, 1);
++    if (err)
++        return err;
++
++    *data = (int)valb;
++    return 0;
++}
++
++/* Init ADV7513 */
++static void rzg2ul_adv7513_init(void){
++    struct udevice *bus = NULL, *dev = NULL, *dev_cec = NULL;
++    uint8_t chip_rev;
++    int ret, i = 0;
++
++    printf("ADV7513 Init\r\n");
++
++    /* Get I2C Bus */
++    if (uclass_get_device_by_name(UCLASS_I2C, "i2c@10090800", &bus)){
++        puts("Cannot find I2C bus!\n");
++        return;
++    }
++
++    /* Get CEC Device */
++    ret = i2c_get_chip(bus, ADV7513_CEC_I2C_ADDR, 1, &dev_cec);
++    if (ret){
++        printf("Cannot get ADV7513 CEC device at address 0x%02x!\n", ADV7513_CEC_I2C_ADDR);
++        return;
++    }
++
++    /* Get Device */
++    ret = i2c_get_chip(bus, ADV7513_I2C_ADDR, 1, &dev);
++    if (ret){
++        printf("Cannot get ADV7513 device at address 0x%02x!\n", ADV7513_I2C_ADDR);
++        return;
++    }
++
++    ret = adv7513_i2c_reg_read(dev, ADV7513_CHIP_REVISION, &chip_rev);
++    if (ret)
++    {
++        printf("Failed to read ADV7513 chip revision\n");
++        return;
++    }
++    printf("ADV7513 chip revision: 0x%02x\n", chip_rev);
++
++    // Write fixed registers
++    for (i = 0; i < ARRAY_SIZE(adv7513_fixed_registers); i++)
++    {
++//      printf("Write Register: 0x%lx, Value: 0x%lx\r\n", adv7513_fixed_registers[i].reg, adv7513_fixed_registers[i].def);
++        ret = adv7513_i2c_reg_write(dev, adv7513_fixed_registers[i].reg, 0xff, adv7513_fixed_registers[i].def);
++        if (ret)
++        {
++            printf("Failed to write ADV7513 register 0x%02x\n", adv7513_fixed_registers[i].reg);
++            return ret; // Return error code instead of void
++        }
++    }
++}
++#endif
++
++/* Init FCPVD */
++static void rzg2l_fpvcg_init(void){
++    printf("FCPVD Init\r\n");
++	rzg2l_registers_set(fcpvd_register_values,ARRAY_SIZE(fcpvd_register_values));
++}
++
++/* Init DU */
++static void rzg2l_du_init(void){
++    printf("DU Init\r\n");
++	rzg2l_registers_set(du_register_values,ARRAY_SIZE(du_register_values));
++}
++
++/* Init VPCD */
++static void rzg2l_vcpd_init(void){
++    printf("VCPD Init\r\n");
++	rzg2l_registers_set(vcpd_register_values,ARRAY_SIZE(vcpd_register_values));
++}
++
++/*
++ *Init VPCD for DL
++ */
++/* VSPD control settings for DL */
++static const uint32_t vcpd_dl_register_values[][2] = {
++	{VSPD_VI6_CMD0,			((uint32_t)0x00000000)},
++	//{VSPD_VI6_CLK_CTRL0,		((uint32_t)0)},
++	//{VSPD_VI6_CLK_CTRL1,		((uint32_t)0)},
++	{VSPD_VI6_CLK_DCSWT,		((uint32_t)0x00000808)},
++	//{VSPD_VI6_CLK_DCSM0,		((uint32_t)0)},
++	//{VSPD_VI6_CLK_DCSM1,		((uint32_t)0)},
++	{VSPD_VI6_SRESET,		((uint32_t)0x00000001)},
++	//{VSPD_VI6_MRESET_ENB0,		((uint32_t)0)},
++	//{VSPD_VI6_MRESET_ENB1,		((uint32_t)0)},
++	//{VSPD_VI6_MRESET,		((uint32_t)0)},
++	//{VSPD_VI6_STATUS,		((uint32_t)0)},
++	{VSPD_VI6_WPF0_IRQ_ENB,		((uint32_t)0x00000002)},
++	{VSPD_VI6_WPF0_IRQ_STA,		((uint32_t)0)},
++	{VSPD_VI6_DISP0_IRQ_ENB,	((uint32_t)0)},
++	{VSPD_VI6_DISP0_IRQ_STA,	((uint32_t)0)},
++	{VSPD_VI6_DL_CTRL,		((uint32_t)0x01000001)},
++	{VSPD_VI6_DL_HDR_ADDR0,		((uint32_t)DISPLAY_LIST_HEADER_0)},
++	{VSPD_VI6_DL_SWAP0,		((uint32_t)0x00000004)},
++	{VSPD_VI6_DL_EXT_CTRL0,		((uint32_t)0x00000221)},
++	{VSPD_VI6_DL_BODY_SIZE0,	((uint32_t)0)},
++	//{VSPD_VI6_DL_HDR_REF_ADDR0,	((uint32_t)0)},
++	//{VSPD_VI6_DL_WUPCNT0,		((uint32_t)0)},
++};
++/* VSPD settings for DL */
++static const display_body_t dl_init[] = {
++#if 1
++	{VSPD_VI6_RPF0_SRC_BSIZE,	((uint32_t)(LCD_VACTIVE << 0) | (LCD_HACTIVE << 16))},
++	{VSPD_VI6_RPF0_SRC_ESIZE,	((uint32_t)(LCD_VACTIVE << 0) | (LCD_HACTIVE << 16))},
++#else
++	{VSPD_VI6_RPF0_SRC_BSIZE,	((uint32_t)0x07800438)},
++	{VSPD_VI6_RPF0_SRC_ESIZE,	((uint32_t)0x07800438)},
++#endif
++	{VSPD_VI6_RPF0_INFMT,		((uint32_t)0x00010013)},
++	{VSPD_VI6_RPF0_DSWAP,		((uint32_t)0x0000000C)},
++	//{VSPD_VI6_RPF0_LOC,		((uint32_t)0)},
++	{VSPD_VI6_RPF0_ALPH_SEL,	((uint32_t)0x40040000)},
++	{VSPD_VI6_RPF0_VRTCOL_SET,	((uint32_t)0xFF000000)},
++	//{VSPD_VI6_RPF0_MSKCTRL,		((uint32_t)0)},
++	//{VSPD_VI6_RPF0_MSKSET0,		((uint32_t)0)},
++	//{VSPD_VI6_RPF0_MSKSET1,		((uint32_t)0)},
++	//{VSPD_VI6_RPF0_CKEY_CTRL,	((uint32_t)0)},
++	//{VSPD_VI6_RPF0_CKEY_SET0,	((uint32_t)0)},
++	//{VSPD_VI6_RPF0_CKEY_SET1,	((uint32_t)0)},
++#if 1
++	{VSPD_VI6_RPF0_SRCM_PSTRIDE,	((uint32_t)((LCD_HACTIVE * 1) << 0) | ((LCD_HACTIVE * 4) << 16))},
++#else
++	{VSPD_VI6_RPF0_SRCM_PSTRIDE,	((uint32_t)0x1E000000)},
++#endif
++	//{VSPD_VI6_RPF0_SRCM_ASTRIDE,	((uint32_t)0)},
++	{VSPD_VI6_RPF0_SRCM_ADDR_Y,	(LCD_SRCM_ADDR)},
++	//{VSPD_VI6_RPF0_SRCM_ADDR_C0,	((uint32_t)0)},
++	//{VSPD_VI6_RPF0_SRCM_ADDR_C1,	((uint32_t)0)},
++	//{VSPD_VI6_RPF0_SRCM_ADDR_AI,	((uint32_t)0)},
++	//{VSPD_VI6_RPF0_BAC,		((uint32_t)0)},
++	{VSPD_VI6_RPF0_MULT_ALPH,	((uint32_t)0x000000FF)},
++	{VSPD_VI6_WPF0_SRCRPF,		((uint32_t)0x02000001)},
++#if 1
++	{VSPD_VI6_WPF0_HSZCLIP,		((uint32_t)(0x10000000 | LCD_HACTIVE))},
++	{VSPD_VI6_WPF0_VSZCLIP,		((uint32_t)(0x10000000 | LCD_VACTIVE))},
++#else
++	{VSPD_VI6_WPF0_HSZCLIP,		((uint32_t)0x10000780)},
++	{VSPD_VI6_WPF0_VSZCLIP,		((uint32_t)0x10000438)},
++#endif
++	{VSPD_VI6_WPF0_OUTFMT,		((uint32_t)0xFF000000)},
++	{VSPD_VI6_WPF0_DSWAP,		((uint32_t)0x00000000)},
++	//{VSPD_VI6_WPF0_RNDCTRL,		((uint32_t)0)},
++	//{VSPD_VI6_WPF0_DSTM_STRIDE_Y,	((uint32_t)0)},
++	//{VSPD_VI6_WPF0_DSTM_STRIDE_C,	((uint32_t)0)},
++	//{VSPD_VI6_WPF0_DSTM_ADDR_Y,	((uint32_t)0)},
++	//{VSPD_VI6_WPF0_DSTM_ADDR_C0,	((uint32_t)0)},
++	//{VSPD_VI6_WPF0_DSTM_ADDR_C1,	((uint32_t)0)},
++	//{VSPD_VI6_WPF0_WRBCK_CTRL,	((uint32_t)0)},
++	{VSPD_VI6_DPR_RPF0_ROUTE,	((uint32_t)0x00000026)},
++	{VSPD_VI6_DPR_RPF1_ROUTE,	((uint32_t)0x0000003F)},
++	{VSPD_VI6_DPR_WPF0_FPORCH,	((uint32_t)0x00000500)},
++	{VSPD_VI6_DPR_LUT_ROUTE,	((uint32_t)0x0000003F)},
++	{VSPD_VI6_DPR_BRS_ROUTE,	((uint32_t)0x10000038)},
++	//{VSPD_VI6_LUT_CTRL,		((uint32_t)0)},
++	{VSPD_VI6_BRS_INCTRL,		((uint32_t)0x10000000)},
++#if 1
++	{VSPD_VI6_BRS_VIRRPF_SIZE,	((uint32_t)(LCD_VACTIVE << 0) | (LCD_HACTIVE << 16))},
++#else
++	{VSPD_VI6_BRS_VIRRPF_SIZE,	((uint32_t)0x07800438)},
++#endif
++	//{VSPD_VI6_BRS_VIRRPF_LOC,	((uint32_t)0)},
++	{VSPD_VI6_BRS_VIRRPF_COL,	((uint32_t)0xFF000000)},
++	{VSPD_VI6_BRSA_CTRL,		((uint32_t)0x80400000)},
++	{VSPD_VI6_BRSA_BLD,		((uint32_t)0x323400FF)},
++	{VSPD_VI6_BRSB_CTRL,		((uint32_t)0x00010000)},
++	{VSPD_VI6_BRSB_BLD,		((uint32_t)0x323400FF)},
++	{VSPD_VI6_LIF0_CTRL,		((uint32_t)0x05DC0003)},
++	{VSPD_VI6_LIF0_CSBTH,		((uint32_t)0x00000000)},
++	{VSPD_VI6_LIF0_LBA,		((uint32_t)0x86000000)},
++	//{VSPD_VI6_LIF0_PADLN_CYC,	((uint32_t)0)},
++	//{VSPD_VI6_LIF0_PADLN_PT,	((uint32_t)0)},
++	//{VSPD_VI6_LIF0_PADLN_VAL,	((uint32_t)0)},
++	//{VSPD_VI6_LIF0_PADLN_SIZE,	((uint32_t)0)},
++};
++
++static display_header_t *dl_headers[3];
++static display_body_t *dl_body[3];
++
++static void rzg2l_vcpd_dl_init(void)
++{
++	int i;
++	display_header_t *header;
++	display_body_t *body;
++
++	printf("VCPD Init for DL\r\n");
++	rzg2l_registers_set(vcpd_dl_register_values,ARRAY_SIZE(vcpd_dl_register_values));
++
++	/* Init DL */
++	dl_headers[0] = (display_header_t *)DISPLAY_LIST_HEADER_0;
++	dl_headers[1] = (display_header_t *)DISPLAY_LIST_HEADER_1;
++	dl_headers[2] = (display_header_t *)DISPLAY_LIST_HEADER_2;
++	for (i = 0; i < 3; i++) {
++		memset(dl_headers[i], 0x00, sizeof (display_header_t));
++	}
++	dl_body[0] = (display_body_t *)DISPLAY_LIST_0;
++	dl_body[1] = (display_body_t *)DISPLAY_LIST_1;
++	dl_body[2] = (display_body_t *)DISPLAY_LIST_2;
++
++	/* Setup DL bodies */
++	body = dl_body[0];
++	for (i = 0; i < (sizeof dl_init)/(sizeof (display_body_t)); i++) {
++		body->address = dl_init[i].address;
++		body->data = dl_init[i].data;
++		body++;
++	}
++	body = dl_body[1];
++	body->address = VSPD_VI6_RPF0_SRCM_ADDR_Y;
++	body->data = LCD_SRCM_ADDR;
++	body = dl_body[2];
++	body->address = VSPD_VI6_RPF0_SRCM_ADDR_Y;
++	body->data = LCD_SRCM_ADDR;
++
++	/* Setup DL headers */
++	header = dl_headers[0];
++	header->num_list = 0;
++	header->list[0].num_bytes = (sizeof dl_init);
++	header->list[0].pList = (uint32_t)dl_body[0];
++	header->pNext_header = DISPLAY_LIST_HEADER_1;
++	header->flags = 1;
++
++	header = dl_headers[1];
++	header->num_list = 0;
++	header->list[0].num_bytes = 1 * (sizeof (display_body_t));
++	header->list[0].pList = (uint32_t)dl_body[1];
++	header->pNext_header = DISPLAY_LIST_HEADER_1;
++	header->flags = 1;
++
++	header = dl_headers[2];
++	header->num_list = 0;
++	header->list[0].num_bytes = 1 * (sizeof (display_body_t));
++	header->list[0].pList = (uint32_t)dl_body[2];
++	header->pNext_header = DISPLAY_LIST_HEADER_2;
++	header->flags = 1;
++}
++
++void rzg2l_video_update(void)
++{
++	display_header_t *header;
++	display_body_t *body;
++	static int count = 0;
++
++	count++;
++	if (count >= LCD_SRCM_FB_NUM)
++		return;
++
++	header = ((count & 1) == 0) ? dl_headers[1]: dl_headers[2];
++	body = (display_body_t *)header->list[0].pList;
++
++	dcache_disable();
++
++	body->data = LCD_SRCM_ADDR + LCD_SRCM_ADDR_OFFS * count;
++	reg_write(VSPD_VI6_DL_HDR_ADDR0, (uint32_t)header);
++
++	dcache_enable();
++}
++
++/* Start LCDC */
++static void rzg2l_lcdc_start(void)
++{
++    //----- Start Video Output -----
++    reg_write(VSPD_base_addr + 0x0000, 0x00000001); // VI6_CMD0: STRCMD=1
++    while ((reg_read(VSPD_base_addr + 0x007C) & 0x00000100) != 0x00000100);// Wait until VI6_DISP0_IRQ_STA.DST=1
++
++#if (DISPLAY_MODE != PARALLEL_RGB_720P)
++    reg_write(DU_base_addr + 0x0000, 0x00000100);   // DU_MCR0 : DI_EN=1
++    while ((reg_read(DSI_LINK_base_addr + ISR) & 0x00000100) != 0x00000100);// ISR.VIN1
++#endif
++}
++
++static void wait(int delay)
++{
++	unsigned long ts;
++
++        while (delay > 0) {
++                --delay;
++                /* delay 1000 ms */
++                ts = get_timer(0);
++                do {
++                        udelay(10000);
++                } while (get_timer(ts) < 1000);
++        }
++}
+diff --git a/drivers/video/rzg2l/rzg2l_video.h b/drivers/video/rzg2l/rzg2l_video.h
+new file mode 100644
+index 0000000000..e422770d0a
+--- /dev/null
++++ b/drivers/video/rzg2l/rzg2l_video.h
+@@ -0,0 +1,277 @@
++#ifndef _RZG2L_VIDEO_H_
++#define _RZG2L_VIDEO_H_
++
++/* U-boot Header*/
++#include <dm/uclass.h>
++#include <dm/device_compat.h>
++#include <cpu_func.h>
++#include <common.h>
++#include <asm/io.h>
++#include <i2c.h>
++#include <linux/delay.h>
++#include <string.h>
++
++/* Register Define */
++#include "dsi_reg.h"
++#include "rzg2l_def.h"
++
++#define ADV7535_SADDR		0x7A
++#define ADV7535_DSI_CEC_ADDR	0x78 
++
++/* Du Define */
++
++#define DU_DITR1		0x14
++#define DU_DITR1_VSA(x)		((x) << 0)
++#define DU_DITR1_VACTIVE(x)	((x) << 16)
++
++#define DU_DITR2		0x18
++#define DU_DITR2_VBP(x)		((x) << 0)
++#define DU_DITR2_VFP(x)		((x) << 16)
++
++#define DU_DITR3		0x1C
++#define DU_DITR3_HSA(x)		((x) << 0)
++#define DU_DITR3_HACTIVE(x)	((x) << 16)
++
++#define DU_DITR4		0x20
++#define DU_DITR4_HBP(x)		((x) << 0)
++#define DU_DITR4_HFP(x)		((x) << 16)
++
++#define DU_DITR5		0x24
++#define DU_DITR5_VSFT(x)	((x) << 0)
++#define DU_DITR5_HSFT(x)	((x) << 16)
++
++#define DU_PBCR0		0x4C
++#define DU_PBCR0_PB_DEP(x)	((x) << 0)
++
++/* DPHY Registers */
++#define DSIDPHYCTRL0			0x00
++#define DSIDPHYCTRL0_CAL_EN_HSRX_OFS	(1 << 16)
++#define DSIDPHYCTRL0_CMN_MASTER_EN	(1 << 8)
++#define DSIDPHYCTRL0_RE_VDD_DETVCCQLV18	(1 << 2)
++#define DSIDPHYCTRL0_EN_LDO1200		(1 << 1)
++#define DSIDPHYCTRL0_EN_BGR		(1 << 0)
++
++#define DSIDPHYTIM0			0x04
++#define DSIDPHYTIM0_TCLK_MISS(x)	((x) << 24)
++#define DSIDPHYTIM0_T_INIT(x)		((x) << 0)
++
++#define DSIDPHYTIM1			0x08
++#define DSIDPHYTIM1_THS_PREPARE(x)	((x) << 24)
++#define DSIDPHYTIM1_TCLK_PREPARE(x)	((x) << 16)
++#define DSIDPHYTIM1_THS_SETTLE(x)	((x) << 8)
++#define DSIDPHYTIM1_TCLK_SETTLE(x)	((x) << 0)
++
++#define DSIDPHYTIM2			0x0C
++#define DSIDPHYTIM2_TCLK_TRAIL(x)	((x) << 24)
++#define DSIDPHYTIM2_TCLK_POST(x)	((x) << 16)
++#define DSIDPHYTIM2_TCLK_PRE(x)		((x) << 8)
++#define DSIDPHYTIM2_TCLK_ZERO(x)	((x) << 0)
++
++#define DSIDPHYTIM3			0x10
++#define DSIDPHYTIM3_TLPX(x)		((x) << 24)
++#define DSIDPHYTIM3_THS_EXIT(x)		((x) << 16)
++#define DSIDPHYTIM3_THS_TRAIL(x)	((x) << 8)
++#define DSIDPHYTIM3_THS_ZERO(x)		((x) << 0)
++
++#define DSIDPHYCTRL1			0x40
++#define DSIDPHYCTRL1_TRIM_REGSEL	(1 << 0)
++
++/* DSI Link*/
++
++    /* Clock Lane Stop Time Set Register */
++#define CLSTPTSETR			0x314
++#define CLSTPTSETR_CLKKPT(x)		((x) << 24)
++#define CLSTPTSETR_CLKBFHT(x)		((x) << 16)
++#define CLSTPTSETR_CLKSTPT(x)		((x) << 2)
++
++    /* LP Transition Time Set Register */
++#define LPTRNSTSETR			0x318
++#define LPTRNSTSETR_GOLPBKT(x)		((x) << 0)
++
++    /* Video-Input Channel 1 Set 1 Register */
++#define VICH1SET1R			0x404
++#define VICH1SET1R_DLY(x)		(((x) & 0xfff) << 2)
++
++    /* Video-Input Channel 1 Vertical Size Set Register */
++#define VICH1VSSETR			0x428
++#define VICH1VSSETR_VACTIVE(x)		(((x) & 0x7fff) << 16)
++#define VICH1VSSETR_VSPOL_LOW		(1 << 15)
++#define VICH1VSSETR_VSPOL_HIGH		(0 << 15)
++#define VICH1VSSETR_VSA(x)		(((x) & 0xfff) << 0)
++
++    /* Video-Input Channel 1 Vertical Porch Set Register */
++#define VICH1VPSETR			0x42C
++#define VICH1VPSETR_VFP(x)		(((x) & 0x1fff) << 16)
++#define VICH1VPSETR_VBP(x)		(((x) & 0x1fff) << 0)
++
++    /* Video-Input Channel 1 Horizontal Size Set Register */
++#define VICH1HSSETR			0x430
++#define VICH1HSSETR_HACTIVE(x)		(((x) & 0x7fff) << 16)
++#define VICH1HSSETR_HSPOL_LOW		(1 << 15)
++#define VICH1HSSETR_HSPOL_HIGH		(0 << 15)
++#define VICH1HSSETR_HSA(x)		(((x) & 0xfff) << 0)
++
++    /* Video-Input Channel 1 Horizontal Porch Set Register */
++#define VICH1HPSETR			0x434
++#define VICH1HPSETR_HFP(x)		(((x) & 0x1fff) << 16)
++#define VICH1HPSETR_HBP(x)		(((x) & 0x1fff) << 0)
++
++/*
++ * Display List
++ */
++typedef struct _display_body_t {
++	/* Set 0 to upper 17bit of address in Display List Body Section. */
++	uint32_t address;
++	uint32_t data;
++} display_body_t;
++
++typedef struct _display_list {
++	/* Specifies the number of bytes in the display list body.
++	* Be sure to specify a multiple of eight bytes.
++	* For the bodies that are not defined in num_list, specify 0. */
++	uint32_t num_bytes;
++	/* Specifies the start address of the display list body.
++	* Be sure to specify an address aligned with an 8-byte boundary.
++	* For the bodies that are not defined in num_list, specify 0. */
++	uint32_t pList;
++} display_list_t;
++
++typedef struct _display_ext {
++	uint32_t padding;
++	/* bit 25 (pre_ext_dl_exec)
++	* If this bit is set to 1, the VSPD executes the extended display list
++	* for frame preprocessing.
++	* bit 24 (post_ext_dl_exec)
++	* Set 0 to this bit.
++	* bit 15-0 (pre_ext_dl_num_cmd)
++	* Specifies the number of commands in the extended display list
++	* body section for frame preprocessing. */
++	uint32_t pre_ext_dl_num_cmd;
++	/* Specifies the start address of the area where the extended display
++	* list body section for frame preprocessing is stored */
++	uint32_t pre_ext_dl_pList;
++	/* Not used. Set 0 to this member. */
++	uint32_t post_ext_dl_num_cmd;
++	/* Not used. Set 0 to this member. */
++	uint32_t post_ext_dl_pList;
++} display_ext_t;
++
++typedef struct _display_header {
++	/* The total number of display list bodies - 1 */
++	uint32_t num_list;
++	display_list_t list[8];
++	/* Specifies the address of the display list header for the next frame.
++	* Be sure to specify an address aligned with an 8-byte boundary. */
++	uint32_t pNext_header;
++	/* bit 8 (wait_wup)
++	* When this bit is 1, VSPD starts reading image data from external
++	* memory after WUP (Wake Up) signal from any channel of VIN asserts.
++	* bit 4 (ignore_upd_dl):
++	* If this bit is set to 1, new display list is not downloaded for
++	* the next frame.
++	* bit 1 (current_frame_int_enable)
++	* This is a flag that indicates whether to set the display list end
++	* interrupt source to 1 when the current frame processing ends.
++	* bit 0 (next_frame_auto_start)
++	* Enables or disables automatic start of next frame processing
++	* when one-frame processing by this display header ends. */
++	uint32_t flags;
++	display_ext_t ext;
++} display_header_t;
++
++#define	VSPD_VI6_CMD0			((uint32_t)VSPD_base_addr + 0x0000u)
++#define	VSPD_VI6_CLK_CTRL0		((uint32_t)VSPD_base_addr + 0x0010u)
++#define	VSPD_VI6_CLK_CTRL1		((uint32_t)VSPD_base_addr + 0x0014u)
++#define	VSPD_VI6_CLK_DCSWT		((uint32_t)VSPD_base_addr + 0x0018u)
++#define	VSPD_VI6_CLK_DCSM0		((uint32_t)VSPD_base_addr + 0x001cu)
++#define	VSPD_VI6_CLK_DCSM1		((uint32_t)VSPD_base_addr + 0x0020u)
++#define	VSPD_VI6_SRESET			((uint32_t)VSPD_base_addr + 0x0028u)
++#define	VSPD_VI6_MRESET_ENB0		((uint32_t)VSPD_base_addr + 0x002cu)
++#define	VSPD_VI6_MRESET_ENB1		((uint32_t)VSPD_base_addr + 0x0030u)
++#define	VSPD_VI6_MRESET			((uint32_t)VSPD_base_addr + 0x0034u)
++#define	VSPD_VI6_STATUS			((uint32_t)VSPD_base_addr + 0x0038u)
++#define	VSPD_VI6_WPF0_IRQ_ENB		((uint32_t)VSPD_base_addr + 0x0048u)
++#define	VSPD_VI6_WPF0_IRQ_STA		((uint32_t)VSPD_base_addr + 0x004cu)
++#define	VSPD_VI6_DISP0_IRQ_ENB		((uint32_t)VSPD_base_addr + 0x0078u)
++#define	VSPD_VI6_DISP0_IRQ_STA		((uint32_t)VSPD_base_addr + 0x007cu)
++#define	VSPD_VI6_DL_CTRL		((uint32_t)VSPD_base_addr + 0x0100u)
++#define	VSPD_VI6_DL_HDR_ADDR0		((uint32_t)VSPD_base_addr + 0x0104u)
++#define	VSPD_VI6_DL_SWAP0		((uint32_t)VSPD_base_addr + 0x0114u)
++#define	VSPD_VI6_DL_EXT_CTRL0		((uint32_t)VSPD_base_addr + 0x011cu)
++#define	VSPD_VI6_DL_BODY_SIZE0		((uint32_t)VSPD_base_addr + 0x0120u)
++#define	VSPD_VI6_DL_HDR_REF_ADDR0	((uint32_t)VSPD_base_addr + 0x0130u)
++#define	VSPD_VI6_DL_WUPCNT0		((uint32_t)VSPD_base_addr + 0x0158u)
++
++#define	VSPD_VI6_RPF0_SRC_BSIZE		((uint32_t)0x0300)
++#define	VSPD_VI6_RPF0_SRC_ESIZE		((uint32_t)0x0304)
++#define	VSPD_VI6_RPF0_INFMT		((uint32_t)0x0308)
++#define	VSPD_VI6_RPF0_DSWAP		((uint32_t)0x030c)
++#define	VSPD_VI6_RPF0_LOC		((uint32_t)0x0310)
++#define	VSPD_VI6_RPF0_ALPH_SEL		((uint32_t)0x0314)
++#define	VSPD_VI6_RPF0_VRTCOL_SET	((uint32_t)0x0318)
++#define	VSPD_VI6_RPF0_MSKCTRL		((uint32_t)0x031c)
++#define	VSPD_VI6_RPF0_MSKSET0		((uint32_t)0x0320)
++#define	VSPD_VI6_RPF0_MSKSET1		((uint32_t)0x0324)
++#define	VSPD_VI6_RPF0_CKEY_CTRL		((uint32_t)0x0328)
++#define	VSPD_VI6_RPF0_CKEY_SET0		((uint32_t)0x032c)
++#define	VSPD_VI6_RPF0_CKEY_SET1		((uint32_t)0x0330)
++#define	VSPD_VI6_RPF0_SRCM_PSTRIDE	((uint32_t)0x0334)
++#define	VSPD_VI6_RPF0_SRCM_ASTRIDE	((uint32_t)0x0338)
++#define	VSPD_VI6_RPF0_SRCM_ADDR_Y	((uint32_t)0x033c)
++#define	VSPD_VI6_RPF0_SRCM_ADDR_C0	((uint32_t)0x0340)
++#define	VSPD_VI6_RPF0_SRCM_ADDR_C1	((uint32_t)0x0344)
++#define	VSPD_VI6_RPF0_SRCM_ADDR_AI	((uint32_t)0x0348)
++#define	VSPD_VI6_RPF0_BAC		((uint32_t)0x0350)
++#define	VSPD_VI6_RPF0_MULT_ALPH		((uint32_t)0x036C)
++#define	VSPD_VI6_WPF0_SRCRPF		((uint32_t)0x1000)
++#define	VSPD_VI6_WPF0_HSZCLIP		((uint32_t)0x1004)
++#define	VSPD_VI6_WPF0_VSZCLIP		((uint32_t)0x1008)
++#define	VSPD_VI6_WPF0_OUTFMT		((uint32_t)0x100c)
++#define	VSPD_VI6_WPF0_DSWAP		((uint32_t)0x1010)
++#define	VSPD_VI6_WPF0_RNDCTRL		((uint32_t)0x1014)
++#define	VSPD_VI6_WPF0_DSTM_STRIDE_Y	((uint32_t)0x101c)
++#define	VSPD_VI6_WPF0_DSTM_STRIDE_C	((uint32_t)0x1020)
++#define	VSPD_VI6_WPF0_DSTM_ADDR_Y	((uint32_t)0x1024)
++#define	VSPD_VI6_WPF0_DSTM_ADDR_C0	((uint32_t)0x1028)
++#define	VSPD_VI6_WPF0_DSTM_ADDR_C1	((uint32_t)0x102c)
++#define	VSPD_VI6_WPF0_WRBCK_CTRL	((uint32_t)0x1034)
++#define	VSPD_VI6_DPR_RPF0_ROUTE		((uint32_t)0x2000)
++#define	VSPD_VI6_DPR_RPF1_ROUTE		((uint32_t)0x2004)
++#define	VSPD_VI6_DPR_WPF0_FPORCH	((uint32_t)0x2014)
++#define	VSPD_VI6_DPR_LUT_ROUTE		((uint32_t)0x203c)
++#define	VSPD_VI6_DPR_BRS_ROUTE		((uint32_t)0x2050)
++#define	VSPD_VI6_LUT_CTRL		((uint32_t)0x2800)
++#define	VSPD_VI6_BRS_INCTRL		((uint32_t)0x3900)
++#define	VSPD_VI6_BRS_VIRRPF_SIZE	((uint32_t)0x3904)
++#define	VSPD_VI6_BRS_VIRRPF_LOC		((uint32_t)0x3908)
++#define	VSPD_VI6_BRS_VIRRPF_COL		((uint32_t)0x390c)
++#define	VSPD_VI6_BRSA_CTRL		((uint32_t)0x3910)
++#define	VSPD_VI6_BRSA_BLD		((uint32_t)0x3914)
++#define	VSPD_VI6_BRSB_CTRL		((uint32_t)0x3918)
++#define	VSPD_VI6_BRSB_BLD		((uint32_t)0x391c)
++#define	VSPD_VI6_LIF0_CTRL		((uint32_t)0x3b00)
++#define	VSPD_VI6_LIF0_CSBTH		((uint32_t)0x3b04)
++#define	VSPD_VI6_LIF0_LBA		((uint32_t)0x3b0c)
++#define	VSPD_VI6_LIF0_PADLN_CYC		((uint32_t)0x3b30)
++#define	VSPD_VI6_LIF0_PADLN_PT		((uint32_t)0x3b34)
++#define	VSPD_VI6_LIF0_PADLN_VAL		((uint32_t)0x3b38)
++#define	VSPD_VI6_LIF0_PADLN_SIZE	((uint32_t)0x3b3C)
++
++/* Display list header address */
++#define DISPLAY_LIST_HEADER_0		((uint32_t)0x5F000000)
++#define DISPLAY_LIST_HEADER_1		((uint32_t)0x5F100000)
++#define DISPLAY_LIST_HEADER_2		((uint32_t)0x5F200000)
++/* Display list body address */
++#define DISPLAY_LIST_0			((uint32_t)0x5F800000)
++#define DISPLAY_LIST_1			((uint32_t)0x5F900000)
++#define DISPLAY_LIST_2			((uint32_t)0x5FA00000)
++
++/* Frame buffer color depth / 8 [byte/pix] */
++#define DISPLAY_FB_BYTE_PER_PIX		(4)
++/* Number of Frame buffer */
++#define LCD_SRCM_FB_NUM			(1)
++
++int rzg2l_video_init(void);
++void rzg2l_video_update(void);
++
++#endif /*_RZG2L_VIDEO_H_*/

@@ -1,0 +1,49 @@
+From 974db5c2291b797fc635a44d9ac74956b63c3f07 Mon Sep 17 00:00:00 2001
+From: Zixuan Zhang <zixuan.zhang.uj@renesas.com>
+Date: Wed, 5 Aug 2026 11:51:11 +0900
+Subject: [PATCH] arm64: dts: renesas: rzg3l-smarc: reserve the U-Boot boot
+ logo memory
+
+The VSPD keeps reading the logo and its display lists at 0x58000000
+while the kernel boots, and the default CMA pool starts there. Reserve
+the area as no-map and move CMA to 0x70000000.
+
+Upstream-Status: Inappropriate [RZ/G3L boot logo, board specific]
+---
+ .../boot/dts/renesas/r9a08g046l48-smarc.dts   | 20 +++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/renesas/r9a08g046l48-smarc.dts b/arch/arm64/boot/dts/renesas/r9a08g046l48-smarc.dts
+index 7fbce3357545..03a5863ac94c 100644
+--- a/arch/arm64/boot/dts/renesas/r9a08g046l48-smarc.dts
++++ b/arch/arm64/boot/dts/renesas/r9a08g046l48-smarc.dts
+@@ -152,11 +152,27 @@ reserved-memory {
+ 		#size-cells = <2>;
+ 		ranges;
+ 
+-		global_cma: linux,cma@58000000 {
++		/*
++		 * U-Boot leaves the VSPD reading this area when Linux starts:
++		 *
++		 *   0x58000000..  frame buffers
++		 *   0x5f000000..  VSPD display list headers
++		 *   0x5f800000..  VSPD display list bodies
++		 *
++		 * no-map keeps it out of the allocators and out of the
++		 * cacheable linear mapping.
++		 */
++		uboot_logo_reserved: framebuffer@58000000 {
++			no-map;
++			reg = <0x0 0x58000000 0x0 0x08000000>;
++		};
++
++		/* Moved from 0x58000000, see above. */
++		global_cma: linux,cma@70000000 {
+ 			compatible = "shared-dma-pool";
+ 			linux,cma-default;
+ 			reusable;
+-			reg = <0x0 0x58000000 0x0 0x10000000>;
++			reg = <0x0 0x70000000 0x0 0x10000000>;
+ 		};
+ 
+ 		mmp_reserved: linux,multimedia {
